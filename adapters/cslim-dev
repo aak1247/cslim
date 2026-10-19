@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+  echo '用法: cslim-dev <本机开发命令> [参数...]，例如 cslim-dev pnpm run cli:check' >&2
+  exit 2
+fi
+
+# Only this command's process tree sees the Cargo shim. Its children use the
+# original PATH after the shim hands a build to cslim, so nested Cargo calls
+# from build scripts cannot wait on their own target lock.
+if [[ "${CSLIM_DEV_ACTIVE:-}" != 1 ]]; then
+  real_cargo="$(command -v cargo)"
+  [[ "$real_cargo" = /* ]] || { echo 'cslim-dev: 找不到绝对路径的 cargo' >&2; exit 1; }
+  export CSLIM_DEV_REAL_CARGO="$real_cargo"
+  export CSLIM_DEV_ORIGINAL_PATH="$PATH"
+  export CSLIM_DEV_BIN="${CSLIM_BIN:-$HOME/.local/bin/cargo-cslim}"
+  [[ -x "$CSLIM_DEV_BIN" ]] || { echo "cslim-dev: 找不到 $CSLIM_DEV_BIN" >&2; exit 1; }
+  export CSLIM_DEV_ACTIVE=1
+  export PATH="$HOME/.local/libexec/cslim:$PATH"
+fi
+
+exec "$@"

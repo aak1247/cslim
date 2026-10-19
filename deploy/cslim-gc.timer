@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly cslim garbage collection
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+Unit=cslim-gc.service
+
+[Install]
+WantedBy=timers.target

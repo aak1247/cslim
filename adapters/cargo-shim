@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${CSLIM_DEV_REAL_CARGO:?请通过 cslim-dev 使用 Cargo shim}"
+: "${CSLIM_DEV_BIN:?请通过 cslim-dev 使用 Cargo shim}"
+: "${CSLIM_DEV_ORIGINAL_PATH:?请通过 cslim-dev 使用 Cargo shim}"
+
+toolchain=()
+if [[ "${1:-}" == +* ]]; then
+  toolchain=("$1")
+  shift
+fi
+
+case "${1:-}" in
+  build|b|check|c|test|t|run|r|bench|doc|d|rustc|rustdoc|clippy|clean)
+    exec env PATH="$CSLIM_DEV_ORIGINAL_PATH" "$CSLIM_DEV_BIN" "${toolchain[@]}" "$@"
+    ;;
+  *)
+    # Cargo allows global options before its subcommand. Never silently send a
+    # build back to native Cargo just because such an option came first.
+    for token in "$@"; do
+      [[ "$token" == '--' ]] && break
+      case "$token" in
+        build|b|check|c|test|t|run|r|bench|doc|d|rustc|rustdoc|clippy|clean)
+          echo 'cslim-dev: 请把 Cargo 全局选项放在构建子命令之后；无法封装此前置参数' >&2
+          exit 2
+          ;;
+      esac
+    done
+    exec env PATH="$CSLIM_DEV_ORIGINAL_PATH" "$CSLIM_DEV_REAL_CARGO" "${toolchain[@]}" "$@"
+    ;;
+esac

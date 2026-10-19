@@ -1,0 +1,9 @@
+[Unit]
+Description=cslim managed target and cache garbage collection
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cargo-cslim gc --apply
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true

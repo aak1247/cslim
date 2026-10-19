@@ -1,0 +1,17 @@
+# User config: ~/.config/cslim/config.toml
+# The default root is ${XDG_CACHE_HOME:-~/.cache}/cslim.
+# Set an absolute root to use another disk, for example: root = "/mnt/fast/cslim"
+# CSLIM_CONFIG selects another config file; CSLIM_HOME or --root overrides root.
+sccache = "sccache"
+target_ttl_days = 14
+cache_ttl_days = 30
+# GiB; a total limit of 0 disables capacity eviction, but not the TTL.
+target_max_gib = 100
+cache_max_gib = 40
+cache_per_toolchain_gib = 10
+# GC after each wrapped build; the timer covers periods without builds.
+auto_gc = true
+
+# Optional named project. Project commands run from the manifest directory.
+# [projects]
+# demo = "/absolute/path/to/demo/Cargo.toml"
