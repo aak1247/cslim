@@ -18,7 +18,7 @@ gh repo clone aak1247/cslim
 cd cslim
 bash install.sh                 # latest release binary, checksum and sccache verified
 bash install.sh --timer         # optionally enable hourly systemd user GC
-bash install.sh --version v0.5.0
+bash install.sh --version v0.6.0
 ```
 
 Once the repository is public, `curl -fsSL https://raw.githubusercontent.com/aak1247/cslim/main/install.sh | bash` works without GitHub CLI. To build from source instead, run `bash scripts/install.sh` after installing sccache. Installation and ordinary use do not require Python.
@@ -39,6 +39,8 @@ cargo +stable cslim build
 cslim status --json     # managed targets, caches, size, and last use
 cslim cache-stats       # sccache statistics for the current toolchain
 cslim target-dir        # target path for the current workspace
+cslim prune             # preview fine-grained cleanup of old artifacts and test binaries
+cslim prune --apply     # reclaim obsolete build artifacts and ephemeral test runners
 cslim gc                # preview; no deletion
 cslim gc --apply        # reclaim eligible idle entries
 cslim clean             # remove this workspace's managed target
@@ -69,7 +71,7 @@ Existing `target/` directories are left alone. To inspect and explicitly import 
 
 Defaults are 14 days of inactivity and **100 GiB total across all managed targets**, 30 days and **40 GiB total across all cache namespaces**, and 10 GiB per sccache namespace. These are not per-project target limits. For example, if two idle targets use 60 GiB and 50 GiB, the next GC can remove the least recently used whole target to get below 100 GiB. An active build can exceed the limit; cslim cannot cap the peak size of a single project, and a 120 GiB target may be reclaimed after that build finishes. Raise `target_max_gib` if you want to retain such a target.
 
-Wrapped builds trigger GC when they finish. The optional timer runs it hourly even when no builds occur. `cslim gc` previews by default; `cslim gc --apply` deletes eligible entries. GC skips active entries and only deletes cslim-owned directories with valid metadata. It never automatically deletes ordinary project `target/` directories or Cargo's registry cache. See the [Chinese documentation](README.zh-CN.md#清理策略) for details.
+Wrapped builds trigger GC when they finish. The optional timer runs it hourly even when no builds occur. `cslim gc` previews by default; `cslim gc --apply` deletes eligible entries. Prior to evicting an entire target, GC performs fine-grained pruning on idle targets to reclaim disk space without blowing away warm build artifacts. Furthermore, `cslim migrate` automatically utilizes Copy-on-Write (reflink via `FICLONE`) on supported filesystems (e.g., XFS, Btrfs) to avoid disk duplication, and `slim_profile = true` strips redundant debuginfo from dependency builds to reduce target sizes by ~40%. GC skips active entries and only deletes cslim-owned directories with valid metadata. It never automatically deletes ordinary project `target/` directories or Cargo's registry cache. See the [Chinese documentation](README.zh-CN.md#清理策略) for details.
 
 ## Development
 

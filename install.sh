@@ -11,7 +11,7 @@ while (($#)); do
     --from) archive_path="${2:?--from requires an archive path}"; shift 2 ;;
     --timer) with_timer=1; shift ;;
     -h|--help)
-      echo 'Usage: bash install.sh [--version v0.5.0] [--timer] [--from /path/to/cslim-x86_64-unknown-linux-musl.tar.gz]'
+      echo 'Usage: bash install.sh [--version v0.6.0] [--timer] [--from /path/to/cslim-x86_64-unknown-linux-musl.tar.gz]'
       exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac

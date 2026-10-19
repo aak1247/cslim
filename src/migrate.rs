@@ -5,7 +5,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
     io::{Read, Write},
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, PermissionsExt},
+        io::AsRawFd,
+    },
     sync::mpsc,
 };
 
@@ -147,7 +151,7 @@ fn cargo_locks(path: &Path) -> Result<Vec<File>> {
         }
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(item.path())?;
         FileExt::try_lock_exclusive(&file).context("Cargo 构建锁正被使用")?;
         locks.push(file);
@@ -166,11 +170,137 @@ fn free_bytes(path: &Path) -> Result<u64> {
     let stat = unsafe { stat.assume_init() };
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
-fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyKind {
+    Reflinked,
+    StandardCopy,
+}
+
+impl std::fmt::Display for CopyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reflinked => write!(f, "reflink"),
+            Self::StandardCopy => write!(f, "copy"),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyStats {
+    pub files: u64,
+    pub reflinked: u64,
+    pub standard_copy: u64,
+}
+
+impl CopyStats {
+    pub fn record(&mut self, kind: CopyKind) {
+        self.files += 1;
+        match kind {
+            CopyKind::Reflinked => self.reflinked += 1,
+            CopyKind::StandardCopy => self.standard_copy += 1,
+        }
+    }
+}
+
+const FICLONE: libc::c_ulong = 0x40049409;
+
+fn is_reflink_unsupported(err: &std::io::Error) -> bool {
+    let Some(code) = err.raw_os_error() else {
+        return false;
+    };
+    code == libc::EOPNOTSUPP
+        || code == libc::ENOTTY
+        || code == libc::EINVAL
+        || code == libc::EXDEV
+        || code == libc::ENOSYS
+        || code == libc::EBADF
+}
+
+fn apply_metadata(path: &Path, meta: &fs::Metadata) -> Result<()> {
+    let times = [
+        libc::timespec {
+            tv_sec: meta.atime() as _,
+            tv_nsec: meta.atime_nsec() as _,
+        },
+        libc::timespec {
+            tv_sec: meta.mtime() as _,
+            tv_nsec: meta.mtime_nsec() as _,
+        },
+    ];
+    let c = CString::new(path.as_os_str().as_bytes())?;
+    let ret = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+    Ok(())
+}
+
+fn try_reflink(
+    source: &Path,
+    destination: &Path,
+    src_meta: &fs::Metadata,
+) -> Result<(), std::io::Error> {
+    let src_file = File::open(source)?;
+    let dst_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(destination)?;
+
+    let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE as _, src_file.as_raw_fd()) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let times = [
+        libc::timespec {
+            tv_sec: src_meta.atime() as _,
+            tv_nsec: src_meta.atime_nsec() as _,
+        },
+        libc::timespec {
+            tv_sec: src_meta.mtime() as _,
+            tv_nsec: src_meta.mtime_nsec() as _,
+        },
+    ];
+    let time_ret = unsafe { libc::futimens(dst_file.as_raw_fd(), times.as_ptr()) };
+    if time_ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    dst_file.set_permissions(fs::Permissions::from_mode(src_meta.mode() & 0o7777))?;
+    Ok(())
+}
+
+fn standard_copy(source: &Path, destination: &Path, src_meta: &fs::Metadata) -> Result<()> {
+    fs::copy(source, destination)?;
+    apply_metadata(destination, src_meta)?;
+    Ok(())
+}
+
+/// 在 Linux 平台上尝试通过 FICLONE ioctl 实现 CoW Reflink 克隆，
+/// 若底层文件系统不支持（或跨文件系统）则优雅降级为标准复制，并保留文件权限与时间戳元数据。
+pub fn reflink_or_copy(source: &Path, destination: &Path) -> Result<CopyKind> {
+    let src_meta = fs::symlink_metadata(source)?;
+    if !src_meta.is_file() {
+        bail!("源路径不是普通文件: {}", source.display());
+    }
+    match try_reflink(source, destination, &src_meta) {
+        Ok(()) => Ok(CopyKind::Reflinked),
+        Err(e) if is_reflink_unsupported(&e) => {
+            standard_copy(source, destination, &src_meta)?;
+            Ok(CopyKind::StandardCopy)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<CopyStats> {
     if fs::symlink_metadata(destination).is_ok() {
         bail!("目标目录已经存在")
     }
     let mut directories = Vec::new();
+    let mut stats = CopyStats::default();
     for item in WalkDir::new(source).follow_links(false) {
         let item = item?;
         let path = item.path();
@@ -181,8 +311,8 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
             fs::create_dir(&target)?;
             directories.push((target, meta.mode() & 0o777));
         } else if meta.is_file() {
-            fs::copy(path, &target)?;
-            fs::set_permissions(&target, fs::Permissions::from_mode(meta.mode() & 0o777))?;
+            let kind = reflink_or_copy(path, &target)?;
+            stats.record(kind);
         } else if meta.file_type().is_symlink() {
             std::os::unix::fs::symlink(fs::read_link(path)?, &target)?;
         } else {
@@ -192,7 +322,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     for (directory, mode) in directories.into_iter().rev() {
         fs::set_permissions(directory, fs::Permissions::from_mode(mode))?;
     }
-    Ok(())
+    Ok(stats)
 }
 fn random_id() -> Result<String> {
     let mut bytes = [0u8; 16];
@@ -356,6 +486,9 @@ fn references(paths: &[PathBuf]) -> Result<BTreeMap<String, Vec<String>>> {
                     let Some(source) = mount["Source"].as_str() else {
                         continue;
                     };
+                    if source.is_empty() {
+                        continue;
+                    }
                     let source = Path::new(source);
                     for path in paths {
                         if source == path || source.starts_with(path) || path.starts_with(source) {
@@ -424,6 +557,8 @@ struct Journal {
     mode: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy_stats: Option<CopyStats>,
 }
 fn journal_write(path: &Path, journal: &Journal) -> Result<()> {
     write_json(path, journal)
@@ -501,12 +636,13 @@ fn move_target<F: Fn(&[PathBuf]) -> Result<()>>(
         bytes: before.bytes,
         mode: fs::symlink_metadata(source)?.mode() & 0o777,
         error: None,
+        copy_stats: None,
     };
     journal_write(&journal_path, &journal)?;
     let mut moved = false;
     let mut committed = false;
     let mut created = false;
-    let result = (|| -> Result<bool> {
+    let result = (|| -> Result<(bool, Option<CopyStats>)> {
         private_dir(entry_dir)?;
         created = true;
         write_json(
@@ -522,16 +658,20 @@ fn move_target<F: Fn(&[PathBuf]) -> Result<()>>(
         }
         let cross = options.copy_always
             || fs::symlink_metadata(&quarantine)?.dev() != fs::symlink_metadata(&store.base)?.dev();
+        let mut copy_stats = None;
         if cross {
             journal.state = "copying".into();
             journal_write(&journal_path, &journal)?;
             let expected = snapshot(&quarantine, true)?;
-            copy_tree(&quarantine, &destination)?;
+            let stats = copy_tree(&quarantine, &destination)?;
             if snapshot(&destination, true)?.contents != expected.contents
                 || snapshot(&quarantine, false)?.signature != before.signature
             {
                 bail!("复制完整性校验失败")
             }
+            copy_stats = Some(stats);
+            journal.copy_stats = Some(stats);
+            journal_write(&journal_path, &journal)?;
         } else {
             fs::rename(&quarantine, &destination)?;
             moved = true;
@@ -560,12 +700,17 @@ fn move_target<F: Fn(&[PathBuf]) -> Result<()>>(
         }
         journal.state = "complete".into();
         journal_write(&journal_path, &journal)?;
-        Ok(cross)
+        Ok((cross, copy_stats))
     })();
     match result {
-        Ok(cross) => Ok(
-            serde_json::json!({"source":source,"destination":destination,"bytes":before.bytes,"copy_verified":cross,"journal":journal_path}),
-        ),
+        Ok((cross, copy_stats)) => Ok(serde_json::json!({
+            "source": source,
+            "destination": destination,
+            "bytes": before.bytes,
+            "copy_verified": cross,
+            "copy_stats": copy_stats,
+            "journal": journal_path
+        })),
         Err(error) => {
             if !committed {
                 if moved && destination.exists() && !quarantine.exists() {
@@ -686,6 +831,8 @@ struct ReportRow {
     destination: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy_stats: Option<CopyStats>,
 }
 #[derive(Serialize)]
 struct Report {
@@ -775,6 +922,7 @@ pub(super) fn run(
             bytes: None,
             destination: None,
             reason: None,
+            copy_stats: None,
         };
         let outcome = (|| -> Result<()> {
             require_markers(&source)?;
@@ -826,6 +974,11 @@ pub(super) fn run(
                     },
                     &no_references,
                 )?;
+                if let Some(stats_val) = imported.get("copy_stats")
+                    && let Ok(stats) = serde_json::from_value::<CopyStats>(stats_val.clone())
+                {
+                    row.copy_stats = Some(stats);
+                }
                 result.imported.push(imported);
                 row.status = "imported".into();
             }
@@ -835,12 +988,24 @@ pub(super) fn run(
         if let Err(e) = outcome {
             row.reason = Some(format!("{e:#}"));
         }
-        eprintln!(
-            "{} {} {}",
-            row.status,
-            human(row.bytes.unwrap_or(0)),
-            source.display()
-        );
+        if let Some(stats) = row.copy_stats {
+            eprintln!(
+                "{} {} {} [文件: {}, reflink: {}, copy: {}]",
+                row.status,
+                human(row.bytes.unwrap_or(0)),
+                source.display(),
+                stats.files,
+                stats.reflinked,
+                stats.standard_copy
+            );
+        } else {
+            eprintln!(
+                "{} {} {}",
+                row.status,
+                human(row.bytes.unwrap_or(0)),
+                source.display()
+            );
+        }
         result.targets.push(row);
         write_json(report_path, &result)?;
     }
@@ -1034,6 +1199,7 @@ mod tests {
             bytes: before.bytes,
             mode: 0o755,
             error: None,
+            copy_stats: None,
         };
         journal_write(&journal_path, &journal).unwrap();
         private_dir(destination.parent().unwrap()).unwrap();
@@ -1059,5 +1225,232 @@ mod tests {
             .spawn()
             .unwrap();
         assert!(wait_output_timeout(child, 1).is_err());
+    }
+
+    #[test]
+    fn reflink_or_copy_basic_and_metadata_preservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("source.bin");
+        let dst = temp.path().join("destination.bin");
+
+        let content = b"reflink test payload with multiple bytes \x00\xff 1234567890";
+        fs::write(&src, content).unwrap();
+
+        let mut perms = fs::symlink_metadata(&src).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&src, perms).unwrap();
+
+        let times = [
+            libc::timespec {
+                tv_sec: 1700000000,
+                tv_nsec: 123456,
+            },
+            libc::timespec {
+                tv_sec: 1700000100,
+                tv_nsec: 654321,
+            },
+        ];
+        let c_src = CString::new(src.as_os_str().as_bytes()).unwrap();
+        unsafe {
+            assert_eq!(
+                libc::utimensat(libc::AT_FDCWD, c_src.as_ptr(), times.as_ptr(), 0),
+                0
+            );
+        }
+
+        let kind = reflink_or_copy(&src, &dst).unwrap();
+        assert!(kind == CopyKind::Reflinked || kind == CopyKind::StandardCopy);
+
+        let dst_content = fs::read(&dst).unwrap();
+        assert_eq!(dst_content, content);
+        assert_eq!(Sha256::digest(content), Sha256::digest(&dst_content));
+
+        let dst_meta = fs::symlink_metadata(&dst).unwrap();
+        assert_eq!(dst_meta.mode() & 0o777, 0o755);
+        assert_eq!(dst_meta.mtime(), 1700000100);
+
+        fs::write(&dst, b"existing garbage data").unwrap();
+        let kind2 = reflink_or_copy(&src, &dst).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), content);
+        assert!(kind2 == CopyKind::Reflinked || kind2 == CopyKind::StandardCopy);
+    }
+
+    #[test]
+    fn reflink_or_copy_empty_and_readonly_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let empty_src = temp.path().join("empty.txt");
+        let empty_dst = temp.path().join("empty_copied.txt");
+        fs::write(&empty_src, b"").unwrap();
+        fs::set_permissions(&empty_src, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let kind = reflink_or_copy(&empty_src, &empty_dst).unwrap();
+        assert!(kind == CopyKind::Reflinked || kind == CopyKind::StandardCopy);
+        assert_eq!(fs::symlink_metadata(&empty_dst).unwrap().len(), 0);
+        assert_eq!(
+            fs::symlink_metadata(&empty_dst).unwrap().mode() & 0o777,
+            0o644
+        );
+
+        let ro_src = temp.path().join("readonly.txt");
+        let ro_dst = temp.path().join("readonly_copied.txt");
+        fs::write(&ro_src, b"read-only contents").unwrap();
+        fs::set_permissions(&ro_src, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let kind = reflink_or_copy(&ro_src, &ro_dst).unwrap();
+        assert!(kind == CopyKind::Reflinked || kind == CopyKind::StandardCopy);
+        assert_eq!(fs::read_to_string(&ro_dst).unwrap(), "read-only contents");
+        assert_eq!(fs::symlink_metadata(&ro_dst).unwrap().mode() & 0o777, 0o444);
+    }
+
+    #[test]
+    fn reflink_or_copy_rejects_directory_and_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("some_dir");
+        fs::create_dir(&dir).unwrap();
+        let dst = temp.path().join("out.bin");
+
+        assert!(reflink_or_copy(&dir, &dst).is_err());
+        assert!(reflink_or_copy(&temp.path().join("nonexistent"), &dst).is_err());
+    }
+
+    #[test]
+    fn reflink_or_copy_cross_filesystem_graceful_fallback() {
+        let root_meta = fs::symlink_metadata("/tmp");
+        let data_meta = fs::symlink_metadata("/data-nvme");
+        if let (Ok(m1), Ok(m2)) = (root_meta, data_meta)
+            && m1.dev() != m2.dev()
+        {
+            let src_dir = tempfile::tempdir_in("/tmp").unwrap();
+            let dst_dir = tempfile::tempdir_in("/data-nvme/more-repos/cslim/target").unwrap();
+
+            let src = src_dir.path().join("cross_fs_source.txt");
+            let dst = dst_dir.path().join("cross_fs_dest.txt");
+            fs::write(&src, b"cross device file payload").unwrap();
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let kind = reflink_or_copy(&src, &dst).unwrap();
+            assert_eq!(kind, CopyKind::StandardCopy);
+            assert_eq!(
+                fs::read_to_string(&dst).unwrap(),
+                "cross device file payload"
+            );
+            assert_eq!(fs::symlink_metadata(&dst).unwrap().mode() & 0o777, 0o755);
+        }
+    }
+
+    #[test]
+    fn reflink_or_copy_on_reflink_capable_filesystem() {
+        let uid = unsafe { libc::geteuid() };
+        let sudo_check = Command::new("sudo").args(["-n", "true"]).status();
+        let mkfs_check = Command::new("which").arg("mkfs.xfs").status();
+        if uid != 0
+            && (sudo_check.is_err()
+                || !sudo_check.unwrap().success()
+                || mkfs_check.is_err()
+                || !mkfs_check.unwrap().success())
+        {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let img = temp.path().join("xfs_reflink.img");
+        let mnt = temp.path().join("mnt");
+        fs::create_dir(&mnt).unwrap();
+
+        let dd = Command::new("dd")
+            .args([
+                "if=/dev/zero",
+                &format!("of={}", img.display()),
+                "bs=1M",
+                "count=128",
+            ])
+            .output();
+        if dd.is_err() || !dd.unwrap().status.success() {
+            return;
+        }
+        let mkfs = Command::new("mkfs.xfs")
+            .args(["-m", "reflink=1", "-f", img.to_str().unwrap()])
+            .output();
+        if mkfs.is_err() || !mkfs.unwrap().status.success() {
+            return;
+        }
+
+        let mount = Command::new("sudo")
+            .args([
+                "-n",
+                "mount",
+                "-o",
+                "loop",
+                img.to_str().unwrap(),
+                mnt.to_str().unwrap(),
+            ])
+            .status();
+        if mount.is_err() || !mount.unwrap().success() {
+            return;
+        }
+        let _ = Command::new("sudo")
+            .args(["-n", "chmod", "777", mnt.to_str().unwrap()])
+            .status();
+
+        struct MountGuard<'a>(&'a Path);
+        impl Drop for MountGuard<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("sudo")
+                    .args(["-n", "umount", self.0.to_str().unwrap()])
+                    .status();
+            }
+        }
+        let _guard = MountGuard(&mnt);
+
+        let src = mnt.join("source.txt");
+        let dst = mnt.join("clone.txt");
+        fs::write(&src, b"original content for cow clone").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let kind = reflink_or_copy(&src, &dst).unwrap();
+        assert_eq!(kind, CopyKind::Reflinked);
+        assert_eq!(
+            fs::read_to_string(&dst).unwrap(),
+            "original content for cow clone"
+        );
+        assert_eq!(fs::symlink_metadata(&dst).unwrap().mode() & 0o777, 0o755);
+
+        // 验证 Copy-on-Write 行为：修改 source，dst 保持不变
+        fs::write(&src, b"modified after clone!").unwrap();
+        assert_eq!(
+            fs::read_to_string(&dst).unwrap(),
+            "original content for cow clone"
+        );
+    }
+
+    #[test]
+    fn copy_tree_records_stats_and_preserves_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let src_tree = temp.path().join("src_tree");
+        let dst_tree = temp.path().join("dst_tree");
+
+        fs::create_dir_all(src_tree.join("sub1/sub2")).unwrap();
+        fs::write(src_tree.join("file1.txt"), "hello").unwrap();
+        fs::write(src_tree.join("sub1/file2.txt"), "world").unwrap();
+        fs::write(src_tree.join("sub1/sub2/file3.txt"), "nested").unwrap();
+        std::os::unix::fs::symlink("file1.txt", src_tree.join("symlink.txt")).unwrap();
+
+        let stats = copy_tree(&src_tree, &dst_tree).unwrap();
+        assert_eq!(stats.files, 3);
+        assert_eq!(stats.reflinked + stats.standard_copy, 3);
+
+        assert_eq!(
+            fs::read_to_string(dst_tree.join("file1.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            fs::read_to_string(dst_tree.join("sub1/file2.txt")).unwrap(),
+            "world"
+        );
+        assert_eq!(
+            fs::read_to_string(dst_tree.join("sub1/sub2/file3.txt")).unwrap(),
+            "nested"
+        );
+        assert!(dst_tree.join("symlink.txt").is_symlink());
     }
 }

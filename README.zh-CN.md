@@ -15,7 +15,7 @@ gh repo clone aak1247/cslim
 cd cslim
 bash install.sh                  # 下载最新 Release、校验 SHA-256、安装二进制
 bash install.sh --timer          # 可选：启用用户级每小时 GC
-bash install.sh --version v0.5.0 # 可选：锁定版本
+bash install.sh --version v0.6.0 # 可选：锁定版本
 ```
 
 未来仓库公开后，无需 `gh`，可直接运行 `curl -fsSL https://raw.githubusercontent.com/aak1247/cslim/main/install.sh | bash`。不使用 Release 时，先安装 sccache，再运行 `bash scripts/install.sh` 从源码编译；也可单独运行 `bash scripts/install-sccache.sh`。预编译包包含 `cargo-cslim`、`cslim-dev`、Cargo shim 和 systemd user unit。
@@ -42,7 +42,9 @@ cargo cslim status             # 所有托管 target/cache 的占用、闲置时
 cargo cslim status --json      # 含编译器版本、workspace、使用状态
 cargo cslim cache-stats        # 当前工具链缓存的命中统计
 cargo cslim config            # 实际生效配置
-cargo cslim gc                # 默认只预览
+cargo cslim prune             # 细粒度裁剪预览：清理历史旧版本产物与测试 runner
+cargo cslim prune --apply     # 执行细粒度裁剪
+cargo cslim gc                # 默认只预览（若容量超限优先尝试 prune 瘦身）
 cargo cslim gc --dry-run
 cargo cslim gc --apply        # 实际回收
 cargo cslim clean             # 清当前 workspace/工具链的 target，保留共享缓存
@@ -155,6 +157,8 @@ cslim migrate --recover /absolute/root/v1/imports/TRANSACTION.json
 | 单个工具链的 sccache | sccache 内部管理 | 10 GiB |
 
 - **100 GiB 是所有受管 target 的合计软上限，不是单个项目限额。**例如项目 A 的闲置 target 占 60 GiB，项目 B 占 50 GiB；下次 GC 发现合计 110 GiB，可整个删除最久未使用的目录，直到低于 100 GiB。
+- **细粒度裁剪（Prune）与瘦身优先。** 在全量淘汰 target 之前，`cslim gc` 会优先对闲置 target 触发细粒度裁剪（清理历史旧版本 `.rlib`/`.rmeta`/`.so` 及跑完即废弃的集成测试可执行文件）。此外，默认开启的 `slim_profile = true` 会向 Cargo 注入依赖免 debuginfo 配置，减少日常构建中约 40% 的 target 增量体积。
+- **CoW (Reflink) 零成本克隆。** 在执行 `cslim migrate` 导入旧 target 时，自动尝试 Linux `FICLONE` 系统调用进行 CoW 克隆；在支持的文件系统（XFS、Btrfs）上实现零额外磁盘开销克隆，并在不支持或跨设备时优雅降级为保留纳秒时间戳的标准复制。
 - **不能限制单次构建的峰值。**一个项目构建到 120 GiB 仍会完成；构建结束后，GC 可能把刚生成的整个 target 删除。若希望保留它，应把 `target_max_gib` 调到高于该项目的实际大小。活跃构建不会被中途删除。
 - 默认 14 天未使用的 target 和 30 天未使用的共享缓存命名空间会过期。封装构建结束后执行 GC；安装 `--timer` 后即使没有构建也每小时检查一次。`cslim gc` 默认只预览，`cslim gc --apply` 才真正删除。普通项目目录下的旧 `target/` 不会自动删除。
 - TTL 在整个 workspace/工具链 target 或共享缓存命名空间层面生效，按最近一次封装调用开始/结束的时间计算，不扫描单个 crate 的使用时间。

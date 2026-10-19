@@ -12,6 +12,15 @@ cache_max_gib = 40
 cache_per_toolchain_gib = 10
 # GC after each wrapped build; the timer covers periods without builds.
 auto_gc = true
+# Strip debuginfo from dependency builds in dev/test profiles to save disk space.
+slim_profile = true
+# Fine-grained target pruning settings:
+# Automatically clean up integration test runner binaries (tests/*.rs) during prune.
+auto_prune_tests = true
+# Number of latest build versions to keep per artifact (rlib, rmeta, bin, so).
+prune_keep = 1
+# Run fine-grained pruning on targets before full eviction during GC.
+gc_prune = true
 
 # Optional named project. Project commands run from the manifest directory.
 # [projects]

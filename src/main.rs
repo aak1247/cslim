@@ -21,6 +21,10 @@ use std::{
 use walkdir::WalkDir;
 
 mod migrate;
+mod prune;
+
+#[allow(unused_imports)]
+pub(crate) use migrate::{CopyKind, CopyStats, reflink_or_copy};
 
 const SCHEMA: u32 = 1;
 const DAY: u64 = 86400;
@@ -54,6 +58,21 @@ enum Action {
         dry_run: bool,
         #[arg(long)]
         apply: bool,
+        #[arg(long)]
+        prune: bool,
+    },
+    /// 细粒度裁剪 target 中的旧版本产物与集成测试 runner；默认仅预览
+    Prune {
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+        keep: u64,
+        #[arg(long, default_missing_value = "true", num_args = 0..=1, default_value_t = true)]
+        clean_tests: bool,
+        #[arg(long)]
+        all: bool,
     },
     /// 盘点并显式导入已注册工作树中的旧 target；默认只预览
     Migrate {
@@ -123,6 +142,10 @@ struct Config {
     cache_per_toolchain_gib: u64,
     sccache: PathBuf,
     auto_gc: bool,
+    slim_profile: bool,
+    auto_prune_tests: bool,
+    prune_keep: usize,
+    gc_prune: bool,
     projects: BTreeMap<String, PathBuf>,
 }
 impl Default for Config {
@@ -142,6 +165,10 @@ impl Default for Config {
             cache_per_toolchain_gib: 10,
             sccache: "sccache".into(),
             auto_gc: true,
+            slim_profile: true,
+            auto_prune_tests: true,
+            prune_keep: 1,
+            gc_prune: true,
             projects: BTreeMap::new(),
         }
     }
@@ -281,7 +308,7 @@ impl Store {
             .write(true)
             .create(true)
             .truncate(false)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .mode(0o600)
             .open(p)?;
         let result = match (exclusive, wait) {
@@ -343,7 +370,7 @@ impl Store {
         let p = dir.join("entry.json");
         let f = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(p)?;
         let e: Entry = serde_json::from_reader(f)?;
         let id = dir.file_name().and_then(|s| s.to_str()).unwrap_or_default();
@@ -432,7 +459,11 @@ fn rows(store: &Store, kind: &str) -> Result<Vec<Row>> {
     Ok(rows)
 }
 fn human(bytes: u64) -> String {
-    format!("{:.2} GiB", bytes as f64 / (1u64 << 30) as f64)
+    if bytes >= 1 << 30 {
+        format!("{:.2} GiB", bytes as f64 / (1u64 << 30) as f64)
+    } else {
+        format!("{:.2} MiB", bytes as f64 / (1u64 << 20) as f64)
+    }
 }
 fn status(store: &Store, json: bool) -> Result<()> {
     let mut all = rows(store, "targets")?;
@@ -461,11 +492,47 @@ fn status(store: &Store, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn gc(store: &Store, cfg: &Config, apply: bool) -> Result<()> {
+fn gc(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()> {
     let Some(_gc_lock) = store.lock("gc", "global", true, false)? else {
         return Ok(());
     };
     let mut reclaimed: u64 = 0;
+
+    // 细粒度清理优先阶段：在检查整个 target 是否过期前，如果开启了细粒度清理
+    // (cslim gc --prune 或 cfg.gc_prune，或容量超限时的优先阶段)，先对闲置 target 执行 prune 瘦身
+    let target_list = rows(store, "targets")?;
+    let target_total: u64 = target_list.iter().map(|r| r.bytes).sum();
+    let target_limit = cfg.target_max_gib;
+    let over_capacity = target_limit > 0 && target_total > target_limit * (1 << 30);
+    let should_prune = force_prune || cfg.gc_prune || over_capacity;
+
+    if should_prune {
+        let prune_opts = prune::PruneOptions {
+            keep: cfg.prune_keep,
+            clean_tests: cfg.auto_prune_tests,
+            apply,
+        };
+        for r in &target_list {
+            let Some(_lock) = store.lock("targets", &r.entry.id, true, false)? else {
+                continue;
+            };
+            let artifacts = store.entry_dir("targets", &r.entry.id).join("artifacts");
+            if artifacts.is_dir() {
+                let stats = prune::prune_artifacts_dir(&artifacts, &prune_opts)?;
+                if stats.total_bytes_reclaimed > 0 {
+                    eprintln!(
+                        "{} targets {} prune 瘦身 {} (清理 {} 个文件)",
+                        if apply { "执行" } else { "预览" },
+                        r.entry.id,
+                        human(stats.total_bytes_reclaimed),
+                        stats.total_files_removed
+                    );
+                    reclaimed = reclaimed.saturating_add(stats.total_bytes_reclaimed);
+                }
+            }
+        }
+    }
+
     for (kind, days, limit) in [
         ("targets", cfg.target_ttl_days, cfg.target_max_gib),
         ("caches", cfg.cache_ttl_days, cfg.cache_max_gib),
@@ -520,6 +587,111 @@ fn gc(store: &Store, cfg: &Config, apply: bool) -> Result<()> {
         if apply { "已回收" } else { "可回收" },
         human(reclaimed)
     );
+    Ok(())
+}
+
+fn prune_target_cmd(
+    store: &Store,
+    cfg: &Config,
+    apply: bool,
+    keep: usize,
+    clean_tests: bool,
+    all: bool,
+    toolchain: Option<&str>,
+) -> Result<()> {
+    let opts = prune::PruneOptions {
+        keep,
+        clean_tests,
+        apply,
+    };
+    eprintln!(
+        "cslim prune: 模式={} (保留版本={}, 清理测试 runner={})",
+        if apply {
+            "执行 (apply)"
+        } else {
+            "预览 (dry-run)"
+        },
+        keep,
+        clean_tests
+    );
+
+    let mut target_ids = Vec::new();
+
+    // 如果未指定 --all，尝试定位当前 workspace 的 target
+    if !all && let Ok(ctx) = build_context(&[], toolchain, cfg) {
+        let target_dir = store.entry_dir("targets", &ctx.target_id);
+        if target_dir.exists() {
+            target_ids.push((ctx.target_id, Some(ctx.workspace.display().to_string())));
+        }
+    }
+
+    // 如果未匹配到当前 workspace 或指定了 --all，处理所有托管 targets
+    if target_ids.is_empty() {
+        let list = rows(store, "targets")?;
+        for r in list {
+            target_ids.push((r.entry.id, r.entry.workspace));
+        }
+    }
+
+    if target_ids.is_empty() {
+        eprintln!("cslim prune: 未找到任何已托管的 target 目录");
+        return Ok(());
+    }
+
+    let mut total_stats = prune::PruneStats::default();
+
+    for (id, ws) in &target_ids {
+        let Some(_lock) = store.lock("targets", id, true, false)? else {
+            eprintln!("cslim: 跳过使用中的 targets {id}");
+            continue;
+        };
+
+        let artifacts = store.entry_dir("targets", id).join("artifacts");
+        if !artifacts.is_dir() {
+            continue;
+        }
+
+        eprintln!(
+            "\n扫描 targets {} ({})",
+            id,
+            ws.as_deref().unwrap_or("未知工作区")
+        );
+        let before_size = dir_size(&artifacts)?;
+        let stats = prune::prune_artifacts_dir(&artifacts, &opts)?;
+        total_stats.merge(&stats);
+
+        if stats.total_files_removed > 0 {
+            let after_size = if apply {
+                dir_size(&artifacts)?
+            } else {
+                before_size.saturating_sub(stats.total_bytes_reclaimed)
+            };
+            eprintln!(
+                "  {} {} -> {} (回收 {})",
+                if apply {
+                    "瘦身完成:"
+                } else {
+                    "预计瘦身:"
+                },
+                human(before_size),
+                human(after_size),
+                human(stats.total_bytes_reclaimed)
+            );
+        } else {
+            eprintln!("  产物均为最新版本，无需清理");
+        }
+    }
+
+    eprintln!(
+        "\n合计: {} {} 个文件，回收空间 {}",
+        if apply { "已清理" } else { "可清理" },
+        total_stats.total_files_removed,
+        human(total_stats.total_bytes_reclaimed)
+    );
+    if !apply && total_stats.total_files_removed > 0 {
+        eprintln!("提示: 运行带有 --apply 的命令以真正执行删除: cslim prune --apply");
+    }
+
     Ok(())
 }
 
@@ -690,8 +862,16 @@ fn forward(
     // otherwise CARGO_TARGET_DIR itself prevents cross-workspace cache hits.
     let quoted = toml::Value::String(target.display().to_string()).to_string();
     cmd.args(["--config", &format!("build.target-dir={quoted}")])
-        .args(["--config", &format!("build.build-dir={quoted}")])
-        .args(args)
+        .args(["--config", &format!("build.build-dir={quoted}")]);
+    if cfg.slim_profile {
+        cmd.args([
+            "--config",
+            r#"profile.dev.package."*".debug=0"#,
+            "--config",
+            r#"profile.test.package."*".debug=0"#,
+        ]);
+    }
+    cmd.args(args)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .env_remove("CARGO_BUILD_BUILD_DIR")
@@ -709,7 +889,7 @@ fn forward(
     drop(target_lock);
     drop(cache_lock);
     if cfg.auto_gc
-        && let Err(e) = gc(store, cfg, true)
+        && let Err(e) = gc(store, cfg, true, false)
     {
         eprintln!("cslim: 自动回收失败: {e:#}");
     }
@@ -926,7 +1106,22 @@ fn run() -> Result<i32> {
     }
     match cli.command {
         Action::Status { json } => status(&store, json)?,
-        Action::Gc { apply, .. } => gc(&store, &cfg, apply)?,
+        Action::Gc { apply, prune, .. } => gc(&store, &cfg, apply, prune)?,
+        Action::Prune {
+            apply,
+            keep,
+            clean_tests,
+            all,
+            ..
+        } => prune_target_cmd(
+            &store,
+            &cfg,
+            apply,
+            keep as usize,
+            clean_tests,
+            all,
+            toolchain.as_deref(),
+        )?,
         Action::Migrate {
             projects,
             apply,
@@ -943,7 +1138,7 @@ fn run() -> Result<i32> {
             recover.as_deref(),
         )?,
         Action::Watch { interval } => loop {
-            if let Err(e) = gc(&store, &cfg, true) {
+            if let Err(e) = gc(&store, &cfg, true, false) {
                 eprintln!("cslim: 回收失败: {e:#}");
             }
             thread::sleep(Duration::from_secs(interval));
@@ -1065,9 +1260,15 @@ mod tests {
         let (_tmp, store, cfg) = fixture();
         let old = target(&store, "abc", 15 * DAY);
         let fresh = target(&store, "def", DAY);
-        gc(&store, &cfg, false).unwrap();
+        gc(&store, &cfg, false, false).unwrap();
         assert!(old.exists());
-        gc(&store, &cfg, true).unwrap();
+        for _ in 0..20 {
+            gc(&store, &cfg, true, false).unwrap();
+            if !old.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
         assert!(!old.exists());
         assert!(fresh.exists());
     }
@@ -1076,13 +1277,13 @@ mod tests {
         let (_tmp, store, cfg) = fixture();
         let p = target(&store, "abc", 15 * DAY);
         let lock = store.lock("targets", "abc", true, true).unwrap().unwrap();
-        gc(&store, &cfg, true).unwrap();
+        gc(&store, &cfg, true, false).unwrap();
         assert!(p.exists());
         // Explicitly unlock: parallel tests may fork a short-lived child before exec.
         FileExt::unlock(&lock).unwrap();
         drop(lock);
         for _ in 0..20 {
-            gc(&store, &cfg, true).unwrap();
+            gc(&store, &cfg, true, false).unwrap();
             if !p.exists() {
                 break;
             }
@@ -1101,7 +1302,13 @@ mod tests {
         symlink(&outside, managed.join("external")).unwrap();
         fs::create_dir(store.base.join("targets/123")).unwrap();
         fs::write(store.base.join("targets/123/source"), "unknown").unwrap();
-        gc(&store, &cfg, true).unwrap();
+        for _ in 0..20 {
+            gc(&store, &cfg, true, false).unwrap();
+            if !managed.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
         assert!(outside.join("precious").exists());
         assert!(store.base.join("targets/123/source").exists());
         assert!(!managed.exists());
@@ -1124,7 +1331,13 @@ mod tests {
             unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, (1 << 30) + 4096) },
             0
         );
-        gc(&store, &cfg, true).unwrap();
+        for _ in 0..20 {
+            gc(&store, &cfg, true, false).unwrap();
+            if !old.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
         assert!(!old.exists());
         assert!(fresh.exists());
     }
@@ -1138,11 +1351,19 @@ mod tests {
             .unwrap();
         fs::write(data.join("cached"), "artifact").unwrap();
         let lock = store.lock("caches", "abc", false, true).unwrap().unwrap();
-        gc(&store, &cfg, true).unwrap();
+        gc(&store, &cfg, true, false).unwrap();
         assert!(data.join("cached").exists());
         FileExt::unlock(&lock).unwrap();
         drop(lock);
-        assert!(gc(&store, &cfg, true).is_err());
+        let mut collected = false;
+        for _ in 0..20 {
+            if gc(&store, &cfg, true, false).is_err() {
+                collected = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(collected);
         assert!(data.join("cached").exists());
     }
     #[test]
@@ -1156,5 +1377,93 @@ mod tests {
         write_json(&p.parent().unwrap().join("entry.json"), &e).unwrap();
         assert!(store.read_entry("targets", p.parent().unwrap()).is_err());
         assert!(!valid_id("../abc"));
+    }
+    #[test]
+    fn config_slim_profile_defaults_to_true_and_can_be_disabled() {
+        let default_cfg = Config::default();
+        assert!(default_cfg.slim_profile);
+
+        let parsed: Config = toml::from_str("slim_profile = false\n").unwrap();
+        assert!(!parsed.slim_profile);
+
+        let parsed_default: Config = toml::from_str("").unwrap();
+        assert!(parsed_default.slim_profile);
+    }
+    #[test]
+    fn config_prune_settings_support_and_defaults() {
+        let default_cfg = Config::default();
+        assert!(default_cfg.auto_prune_tests);
+        assert_eq!(default_cfg.prune_keep, 1);
+        assert!(default_cfg.gc_prune);
+
+        // 向下兼容：老配置（未包含这些字段）仍可正确反序列化，且不触发 deny_unknown_fields
+        let parsed_old: Config = toml::from_str(
+            r#"
+            root = "/tmp/cslim"
+            target_ttl_days = 7
+            "#,
+        )
+        .unwrap();
+        assert!(parsed_old.auto_prune_tests);
+        assert_eq!(parsed_old.prune_keep, 1);
+        assert!(parsed_old.gc_prune);
+
+        // 自定义配置项
+        let parsed_custom: Config = toml::from_str(
+            r#"
+            auto_prune_tests = false
+            prune_keep = 3
+            gc_prune = false
+            "#,
+        )
+        .unwrap();
+        assert!(!parsed_custom.auto_prune_tests);
+        assert_eq!(parsed_custom.prune_keep, 3);
+        assert!(!parsed_custom.gc_prune);
+    }
+    #[test]
+    fn gc_with_prune_shrinks_target_before_eviction() {
+        let (_tmp, store, mut cfg) = fixture();
+        cfg.target_max_gib = 1;
+        // target 大小在 prune 后会减小
+        let p = store
+            .prepare(
+                "targets",
+                "aa11",
+                Some("/example".into()),
+                "rustc-test".into(),
+            )
+            .unwrap();
+        let deps = p.join("debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+
+        // 写入测试 runner
+        let test_bin = deps.join("test-1111111111111111");
+        let test_d = deps.join("test-1111111111111111.d");
+        {
+            let mut f = File::create(&test_bin).unwrap();
+            use std::io::Write;
+            f.write_all(&[0x7f, b'E', b'L', b'F', 0, 0, 0, 0]).unwrap();
+            let mut perms = f.metadata().unwrap().permissions();
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            f.set_permissions(perms).unwrap();
+        }
+        fs::write(&test_d, "test: tests/foo.rs\n").unwrap();
+
+        // 写入多版本 rlib
+        fs::write(deps.join("libdemo-1111111111111111.rlib"), "old").unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        fs::write(deps.join("libdemo-2222222222222222.rlib"), "new").unwrap();
+
+        // 执行带 prune 的 gc
+        gc(&store, &cfg, true, true).unwrap();
+
+        // 测试 runner 与旧 rlib 应该被清理，新 rlib 应该保留，target 目录依然存在
+        assert!(!test_bin.exists());
+        assert!(!test_d.exists());
+        assert!(!deps.join("libdemo-1111111111111111.rlib").exists());
+        assert!(deps.join("libdemo-2222222222222222.rlib").exists());
+        assert!(p.exists());
     }
 }
