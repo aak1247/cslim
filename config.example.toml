@@ -5,7 +5,8 @@
 sccache = "sccache"
 target_ttl_days = 14
 cache_ttl_days = 30
-# GiB; a total limit of 0 disables capacity eviction, but not the TTL.
+# GiB across all managed targets/cache namespaces (soft limits, not per project).
+# A total limit of 0 disables capacity eviction, but not the TTL.
 target_max_gib = 100
 cache_max_gib = 40
 cache_per_toolchain_gib = 10

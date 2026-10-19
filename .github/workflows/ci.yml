@@ -20,5 +20,3 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test development shim
         run: python3 scripts/test_cslim_dev.py
-      - name: Test target migration
-        run: python3 scripts/test_migrate_targets.py

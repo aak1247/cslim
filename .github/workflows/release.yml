@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Match tag to crate version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test "$TAG" = "v$version"
+      - name: Test
+        run: cargo test --locked
+      - name: Build static binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Package release
+        run: bash scripts/package-release.sh x86_64-unknown-linux-musl
+      - name: Test binary installer
+        run: bash scripts/test_install.sh
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/cslim-x86_64-unknown-linux-musl.tar.gz dist/cslim-x86_64-unknown-linux-musl.tar.gz.sha256 --clobber
+          else
+            gh release create "$TAG" dist/cslim-x86_64-unknown-linux-musl.tar.gz dist/cslim-x86_64-unknown-linux-musl.tar.gz.sha256 --verify-tag --title "cslim $TAG" --generate-notes
+          fi

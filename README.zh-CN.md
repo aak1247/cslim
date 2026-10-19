@@ -4,21 +4,21 @@
 
 命令为 `cslim` 或 `cargo cslim`，安装包为 `cargo-cslim`。存储格式版本为 `v1`。
 
-面向 Linux/Unix。需要 Rust/Cargo ≥ 1.91、sccache；Linux x86_64 和 sccache 0.18.0 已验证。该项目不依赖 cargo-sweep 或 cargo-clean-all。
+预编译 Release 支持 Linux x86_64；从源码构建面向 Linux/Unix。运行 Rust 项目构建仍需 Rust/Cargo ≥ 1.91 和 sccache。安装脚本会在缺少 sccache 时下载经固定 SHA-256 校验的 0.18.0 版本。安装及日常使用不需要 Python。
 
 ## 安装
 
+仓库还是 Private 时，先登录 GitHub CLI：
+
 ```bash
-# 已有 sccache 可跳过；此脚本安装 0.18.0 并核对固定 SHA-256
-python3 scripts/install-sccache.py
-
-# 安装到 ~/.local/bin，并启用用户级每小时 GC
-./scripts/install.sh --timer
-
-mkdir -p ~/.config/cslim
-cp config.example.toml ~/.config/cslim/config.toml
-# 如需另一块磁盘，在配置中设置 root 的绝对路径
+gh repo clone aak1247/cslim
+cd cslim
+bash install.sh                  # 下载最新 Release、校验 SHA-256、安装二进制
+bash install.sh --timer          # 可选：启用用户级每小时 GC
+bash install.sh --version v0.5.0 # 可选：锁定版本
 ```
+
+未来仓库公开后，无需 `gh`，可直接运行 `curl -fsSL https://raw.githubusercontent.com/aak1247/cslim/main/install.sh | bash`。不使用 Release 时，先安装 sccache，再运行 `bash scripts/install.sh` 从源码编译；也可单独运行 `bash scripts/install-sccache.sh`。预编译包包含 `cargo-cslim`、`cslim-dev`、Cargo shim 和 systemd user unit。
 
 确保 `~/.local/bin` 和 Rustup 的 Cargo 在 PATH 中。安装后可使用 `cslim build` 或 Cargo 子命令 `cargo cslim build`。配置根目录的父目录必须可写；由工具创建的根目录仅供当前用户使用。如果不配置，默认根目录为 `${XDG_CACHE_HOME:-~/.cache}/cslim`。
 
@@ -92,17 +92,17 @@ cslim project demo --worktree /path/to/old-worktree build --locked
 
 工具核对 Git common directory 和工作树根路径，拒绝其他仓库、子目录或缺少相应模块的 checkout。每个工作树的 target 独立，共享兼容的 sccache；不会删除、切换、prune 或提交工作树源码。不存在的登记仅在 `--all` 输出中保留，不会迁移。
 
-旧 target 需要显式导入。迁移脚本只查找已注册仓库工作树中对应 Cargo manifest 旁的默认 `target/`，不猜测自定义 `CARGO_TARGET_DIR` 与 workspace 的对应关系：
+旧 target 需要显式导入。`cslim migrate` 只查找已注册仓库工作树中对应 Cargo manifest 旁的默认 `target/`，不猜测自定义 `CARGO_TARGET_DIR` 与 workspace 的对应关系：
 
 ```bash
 # 默认仅预览；report 必须放在源码与被迁移目录之外
-python3 scripts/migrate-targets.py --report /path/to/private/plan.json
+cslim migrate --report /path/to/private/plan.json
 # 核对报告后执行，或通过 --project 限定一个模块
-python3 scripts/migrate-targets.py --project demo \
+cslim migrate --project demo \
   --apply --report /path/to/private/result.json
 ```
 
-迁移使用当前 `cslim config` 中的 root。默认要求目录递归 mtime/ctime 均至少 48 小时无变化，并核对：Rust 标记、Git 未跟踪状态、当前用户所有权、Cargo 构建锁、cslim target 锁、进程 cwd/exe/fd/maps/参数/环境引用、所有 Docker 容器挂载（包含停止的容器）、内部挂载点及目标容量预算。检查进程时通过 `sudo -n` 执行随项目提供的只读 probe；不输出命令行或环境变量内容。检查不完整时不迁移。
+迁移使用当前 `cslim config` 中的 root。默认要求目录递归 mtime/ctime 均至少 48 小时无变化，并核对：Rust 标记、Git 未跟踪状态、当前用户所有权、Cargo 构建锁、cslim target 锁、进程 cwd/exe/fd/maps/参数/环境引用、所有 Docker 容器挂载（包含停止的容器）、内部挂载点及目标容量预算。检查进程时通过 `sudo -n` 执行同一个二进制的只读 probe；不输出命令行或环境变量内容。缺少 sudo 免密授权、Docker 无法检查或检查不完整时会保留原目录。
 
 已有受管目录不会覆盖；有活动引用、近期变化、经过符号链接、含 Git 数据或无法验证的目录均保留。迁移先在原盘同目录暂存并再次检查引用与元数据；同盘 rename，跨盘 copy 后逐文件 SHA-256/链接结构校验，再将所有权交给 cslim 并移除旧副本。操作失败时恢复原目录；若原路径已被其他进程重建则保留副本、报告恢复冲突，不覆盖新目录。普通 GC 不处理未提交的导入暂存数据。
 
@@ -111,7 +111,7 @@ python3 scripts/migrate-targets.py --project demo \
 每个迁移事务的日志保存在 `<root>/v1/imports/*.json`。进程被 SIGKILL / 掉电等中断时，先检查日志和原盘 `.cslim-migration-*` 暂存目录，再执行恢复：
 
 ```bash
-python3 scripts/migrate-targets.py --recover /absolute/root/v1/imports/TRANSACTION.json
+cslim migrate --recover /absolute/root/v1/imports/TRANSACTION.json
 ```
 
 恢复默认回退未提交的导入，已提交的导入只清理经过检查的旧暂存副本；原位置有新目录、数据发生变化或仍被引用时会保留数据并拒绝覆盖。
@@ -154,6 +154,9 @@ python3 scripts/migrate-targets.py --recover /absolute/root/v1/imports/TRANSACTI
 | 共享缓存命名空间 | 30 天未通过封装器使用 | 40 GiB |
 | 单个工具链的 sccache | sccache 内部管理 | 10 GiB |
 
+- **100 GiB 是所有受管 target 的合计软上限，不是单个项目限额。**例如项目 A 的闲置 target 占 60 GiB，项目 B 占 50 GiB；下次 GC 发现合计 110 GiB，可整个删除最久未使用的目录，直到低于 100 GiB。
+- **不能限制单次构建的峰值。**一个项目构建到 120 GiB 仍会完成；构建结束后，GC 可能把刚生成的整个 target 删除。若希望保留它，应把 `target_max_gib` 调到高于该项目的实际大小。活跃构建不会被中途删除。
+- 默认 14 天未使用的 target 和 30 天未使用的共享缓存命名空间会过期。封装构建结束后执行 GC；安装 `--timer` 后即使没有构建也每小时检查一次。`cslim gc` 默认只预览，`cslim gc --apply` 才真正删除。普通项目目录下的旧 `target/` 不会自动删除。
 - TTL 在整个 workspace/工具链 target 或共享缓存命名空间层面生效，按最近一次封装调用开始/结束的时间计算，不扫描单个 crate 的使用时间。
 - 超过总容量上限时按最近使用时间淘汰整个闲置目录。活跃目录不能淘汰，因此这是构建之间的软上限；单次构建仍可能超过上限。
 - `target_max_gib` / `cache_max_gib` 为 0 表示不按总容量回收；TTL 为 0 表示闲置后立即过期。`cache_per_toolchain_gib` 必须大于 0。
@@ -166,7 +169,7 @@ python3 scripts/migrate-targets.py --recover /absolute/root/v1/imports/TRANSACTI
 
 同一 target 的封装调用互斥；不同 workspace 可并发构建，共享缓存使用读锁。GC 使用非阻塞独占锁跳过活跃目录，并在真正删除前重新核对最近使用时间。锁文件独立于被清理的目录，避免删除后重建产生两把锁。锁描述符传给 Cargo 子进程，即使封装器被 SIGKILL，仍在运行的子构建也受保护。
 
-仅回收本工具创建且记录验证通过的目录，拒绝符号链接根目录、错误元数据和其他用户可写的托管目录。普通 GC 不扫描历史项目 `target/`、外部 `CARGO_TARGET_DIR`、Cargo registry 源码或下载缓存。首次构建会创建新 target；只有显式执行上述迁移脚本才会导入通过检查的旧产物。
+仅回收本工具创建且记录验证通过的目录，拒绝符号链接根目录、错误元数据和其他用户可写的托管目录。普通 GC 不扫描历史项目 `target/`、外部 `CARGO_TARGET_DIR`、Cargo registry 源码或下载缓存。首次构建会创建新 target；只有显式执行上述迁移命令才会导入通过检查的旧产物。
 
 持续管理的前提是构建走 `cargo cslim`。请不要直接使用原生 Cargo、IDE 或其他脚本写入本工具托管的目录，否则这些进程没有 GC 锁。IDE 可继续使用自己的默认 target；长期运行的程序应部署到托管目录之外。
 
@@ -180,10 +183,11 @@ cargo build --locked
 python3 scripts/smoke.py
 python3 scripts/test_cslim_dev.py
 python3 scripts/test_worktrees.py /path/to/cargo-cslim
-python3 scripts/test_migrate_targets.py
 ```
 
 集成测试使用临时 workspace 和真实 Cargo/sccache，验证命名项目与项目配置加载、跨项目命中、缓存版本隔离、依赖版本升级、Cargo JSON/退出码、GC 预览/实际删除、旧 target 保留、并发构建，以及 supervisor 被 SIGKILL 后的回收保护。测试依赖本机 Cargo 缓存已有 `itoa 1.0.18`；本项目的正常构建会准备该版本，无需测试时下载 registry。
+
+上述 Python 文件仅用于开发测试；安装、迁移、回收和普通构建都由 Bash 与 Rust 二进制完成。
 
 ## 停用与回滚
 

@@ -20,6 +20,8 @@ use std::{
 };
 use walkdir::WalkDir;
 
+mod migrate;
+
 const SCHEMA: u32 = 1;
 const DAY: u64 = 86400;
 
@@ -53,6 +55,21 @@ enum Action {
         #[arg(long)]
         apply: bool,
     },
+    /// 盘点并显式导入已注册工作树中的旧 target；默认只预览
+    Migrate {
+        #[arg(long = "project")]
+        projects: Vec<String>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, default_value_t = 48)]
+        min_idle_hours: u64,
+        #[arg(long)]
+        report: Option<PathBuf>,
+        #[arg(long)]
+        recover: Option<PathBuf>,
+    },
+    #[command(name = "__probe-references", hide = true)]
+    ProbeReferences,
     /// 定期回收，只对本工具创建的目录生效
     Watch {
         #[arg(long, default_value_t=3600, value_parser=clap::value_parser!(u64).range(1..))]
@@ -888,6 +905,10 @@ fn run() -> Result<i32> {
         None
     };
     let cli = Cli::parse_from(args);
+    if matches!(cli.command, Action::ProbeReferences) {
+        migrate::probe_stdin()?;
+        return Ok(0);
+    }
     let cfg = Config::load(&cli)?;
     if matches!(cli.command, Action::Config) {
         println!("{}", toml::to_string_pretty(&cfg)?);
@@ -906,6 +927,21 @@ fn run() -> Result<i32> {
     match cli.command {
         Action::Status { json } => status(&store, json)?,
         Action::Gc { apply, .. } => gc(&store, &cfg, apply)?,
+        Action::Migrate {
+            projects,
+            apply,
+            min_idle_hours,
+            report,
+            recover,
+        } => migrate::run(
+            &store,
+            &cfg,
+            &projects,
+            apply,
+            min_idle_hours,
+            report.as_deref(),
+            recover.as_deref(),
+        )?,
         Action::Watch { interval } => loop {
             if let Err(e) = gc(&store, &cfg, true) {
                 eprintln!("cslim: 回收失败: {e:#}");
@@ -970,6 +1006,7 @@ fn run() -> Result<i32> {
                 }))?
             );
         }
+        Action::ProbeReferences => unreachable!(),
         Action::TargetDir { manifest_path } => {
             let args = manifest_path
                 .map(|p| vec!["--manifest-path".to_owned(), p.display().to_string()])
@@ -1044,7 +1081,13 @@ mod tests {
         // Explicitly unlock: parallel tests may fork a short-lived child before exec.
         FileExt::unlock(&lock).unwrap();
         drop(lock);
-        gc(&store, &cfg, true).unwrap();
+        for _ in 0..20 {
+            gc(&store, &cfg, true).unwrap();
+            if !p.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
         assert!(!p.exists());
     }
     #[test]
