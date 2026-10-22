@@ -50,7 +50,18 @@ cargo cslim gc --apply        # 实际回收
 cargo cslim clean             # 清当前 workspace/工具链的 target，保留共享缓存
 ```
 
-支持 build/check/test/run/bench/doc/rustc/rustdoc/clippy/clean 及 Cargo 常见短别名。依赖管理、发布、安装等其他命令直接使用原生 Cargo。默认每次封装命令结束后执行 GC，长期不构建时由 timer 触发。
+外部进程需要在 Cargo 命令结束后继续使用受管 target 时，可显式 pin：
+
+```bash
+cslim pin --target-dir "$(cslim target-dir)" --owner shipbraid \
+  --reason "container build target" --metadata '{"container_id":"immutable-id"}'
+cslim pins --json
+cslim unpin PIN_ID --owner shipbraid
+```
+
+`pin` 在 stdout 返回包含 pin ID 的 JSON。Pin 不会自动过期，会阻止 GC、`prune` 和 `cslim clean` 清理对应 target；只有同一 owner 可移除。容器适配器应在 metadata 记录 engine endpoint 和完整 immutable container ID，并且只有受信引擎 API 确认该精确 ID 已 stopped/dead，或确认它已消失且不存在 owner/recreation 歧义时才调用 `unpin`；状态未知时保留 pin。宿主 CLI 退出不会释放 pin。Metadata 会持久化并可通过 `cslim pins --json` 查看，不要放入密钥。Pin 只适用于已经存在的 cslim 受管 target，不会登记、导入或回收任意 `CARGO_TARGET_DIR`。
+
+支持 build/check/test/run/bench/doc/rustc/rustdoc/clippy/clean 及 Cargo 常见短别名。依赖管理、发布、安装等其他命令直接使用原生 Cargo。封装命令结束后按 `auto_gc_min_interval_secs` 节流触发 GC，长期不构建时由 timer 触发。
 
 封装器日志写 stderr，保留 Cargo stdout（包括 `--message-format=json`）及正常失败码。可执行文件位于日志或 `status` 显示的托管 `artifacts/` 中，不再写入项目原来的 `target/`。
 
@@ -157,10 +168,10 @@ cslim migrate --recover /absolute/root/v1/imports/TRANSACTION.json
 | 单个工具链的 sccache | sccache 内部管理 | 10 GiB |
 
 - **100 GiB 是所有受管 target 的合计软上限，不是单个项目限额。**例如项目 A 的闲置 target 占 60 GiB，项目 B 占 50 GiB；下次 GC 发现合计 110 GiB，可整个删除最久未使用的目录，直到低于 100 GiB。
-- **细粒度裁剪（Prune）与瘦身优先。** 在全量淘汰 target 之前，`cslim gc` 仅对过期或总容量超限时需要回收的闲置 target 进行细粒度裁剪，容量回到上限以内后即停止容量裁剪。未过期且未超额的热 target 保留依赖/feature 变体和集成测试可执行文件，避免每次构建结束都删除下一次仍会使用的产物。显式 `cslim prune` 或 `cslim gc --prune` 仍可裁剪热 target，随后 Cargo 可能需要重建被删变体。此外，默认开启的 `slim_profile = true` 会向 Cargo 注入依赖免 debuginfo 配置，减少日常构建中约 40% 的 target 增量体积。
+- **细粒度裁剪（Prune）与瘦身优先。** 在全量淘汰 target 之前，`cslim gc` 仅对过期或总容量超限时需要回收的闲置 target 进行细粒度裁剪，容量回到上限以内后即停止容量裁剪。未过期且未超额的热 target 保留依赖/feature 变体和集成测试可执行文件，避免 routine GC 删除下一次仍会使用的产物。显式 `cslim prune` 或 `cslim gc --prune` 仍可裁剪热 target，随后 Cargo 可能需要重建被删变体。此外，默认开启的 `slim_profile = true` 会向 Cargo 注入依赖免 debuginfo 配置，减少日常构建中约 40% 的 target 增量体积。
 - **CoW (Reflink) 零成本克隆。** 在执行 `cslim migrate` 导入旧 target 时，自动尝试 Linux `FICLONE` 系统调用进行 CoW 克隆；在支持的文件系统（XFS、Btrfs）上实现零额外磁盘开销克隆，并在不支持或跨设备时优雅降级为保留纳秒时间戳的标准复制。
 - **不能限制单次构建的峰值。**一个项目构建到 120 GiB 仍会完成；构建结束后，GC 可能把刚生成的整个 target 删除。若希望保留它，应把 `target_max_gib` 调到高于该项目的实际大小。活跃构建不会被中途删除。
-- 默认 14 天未使用的 target 和 30 天未使用的共享缓存命名空间会过期。封装构建结束后执行 GC；安装 `--timer` 后即使没有构建也每小时检查一次。`cslim gc` 默认只预览，`cslim gc --apply` 才真正删除。普通项目目录下的旧 `target/` 不会自动删除。
+- 默认 14 天未使用的 target 和 30 天未使用的共享缓存命名空间会过期。封装构建结束后最多每 300 秒自动扫描一次，时间戳由全局 GC 锁保护；设 `auto_gc_min_interval_secs = 0` 可恢复每次构建结束扫描。显式 `cslim gc` 与 `watch` 不受节流影响，需要时可主动发起回收扫描；安装 `--timer` 后即使没有构建也每小时检查一次。`cslim gc` 默认只预览，`cslim gc --apply` 才真正删除。普通项目目录下的旧 `target/` 不会自动删除。
 - TTL 在整个 workspace/工具链 target 或共享缓存命名空间层面生效，按最近一次封装调用开始/结束的时间计算，不扫描单个 crate 的使用时间。
 - 超过总容量上限时按最近使用时间淘汰整个闲置目录。活跃目录不能淘汰，因此这是构建之间的软上限；单次构建仍可能超过上限。
 - `target_max_gib` / `cache_max_gib` 为 0 表示不按总容量回收；TTL 为 0 表示闲置后立即过期。`cache_per_toolchain_gib` 必须大于 0。
@@ -171,9 +182,9 @@ cslim migrate --recover /absolute/root/v1/imports/TRANSACTION.json
 
 ## 并发与回收边界
 
-同一 target 的封装调用互斥；不同 workspace 可并发构建，共享缓存使用读锁。GC 使用非阻塞独占锁跳过活跃目录，并在真正删除前重新核对最近使用时间。锁文件独立于被清理的目录，避免删除后重建产生两把锁。锁描述符传给 Cargo 子进程，即使封装器被 SIGKILL，仍在运行的子构建也受保护。
+同一 target 的封装调用互斥；不同 workspace 可并发构建，共享缓存使用读锁。GC 使用非阻塞独占锁跳过活跃目录，并在真正删除前重新核对最近使用时间。Pin 的创建和移除持有同一 target 的共享锁，与 GC 的独占锁互斥；有效 pin 会出现在 status/preview 中，并保护 target 不被 GC、prune 或 `clean` 删除。锁文件独立于被清理的目录，避免删除后重建产生两把锁。锁描述符传给 Cargo 子进程，即使封装器被 SIGKILL，仍在运行的子构建也受保护。
 
-仅回收本工具创建且记录验证通过的目录，拒绝符号链接根目录、错误元数据和其他用户可写的托管目录。普通 GC 不扫描历史项目 `target/`、外部 `CARGO_TARGET_DIR`、Cargo registry 源码或下载缓存。首次构建会创建新 target；只有显式执行上述迁移命令才会导入通过检查的旧产物。
+仅回收本工具创建且记录验证通过的目录，拒绝符号链接根目录、错误元数据和其他用户可写的托管目录。普通 GC 不扫描历史项目 `target/`、外部 `CARGO_TARGET_DIR`、Cargo registry 源码或下载缓存。本版本的 pin 不能 adopt 任意外部路径；历史 target 仍须通过显式迁移审查，无法验证 owner、元数据或活动引用的目录必须保留。首次构建会创建新 target；只有显式执行上述迁移命令才会导入通过检查的旧产物。
 
 持续管理的前提是构建走 `cargo cslim`。请不要直接使用原生 Cargo、IDE 或其他脚本写入本工具托管的目录，否则这些进程没有 GC 锁。IDE 可继续使用自己的默认 target；长期运行的程序应部署到托管目录之外。
 

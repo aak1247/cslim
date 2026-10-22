@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     fs::{File, OpenOptions},
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     os::unix::{
         fs::{MetadataExt, OpenOptionsExt},
         io::AsRawFd,
@@ -94,6 +94,30 @@ enum Action {
         #[arg(long, default_value_t=3600, value_parser=clap::value_parser!(u64).range(1..))]
         interval: u64,
     },
+    /// 为外部使用方持久保护一个受管 target；必须显式 unpin
+    Pin {
+        #[arg(long)]
+        target_dir: PathBuf,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "{}")]
+        metadata: String,
+    },
+    /// 列出持久 pin；默认仅列出当前用户的所有记录
+    Pins {
+        #[arg(long)]
+        target_dir: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除一个持久 pin
+    Unpin {
+        id: String,
+        #[arg(long)]
+        owner: String,
+    },
     /// 显示当前 workspace 的共享编译缓存统计
     CacheStats,
     /// 打印实际配置
@@ -142,6 +166,7 @@ struct Config {
     cache_per_toolchain_gib: u64,
     sccache: PathBuf,
     auto_gc: bool,
+    auto_gc_min_interval_secs: u64,
     slim_profile: bool,
     auto_prune_tests: bool,
     prune_keep: usize,
@@ -165,6 +190,7 @@ impl Default for Config {
             cache_per_toolchain_gib: 10,
             sccache: "sccache".into(),
             auto_gc: true,
+            auto_gc_min_interval_secs: 300,
             slim_profile: true,
             auto_prune_tests: true,
             prune_keep: 1,
@@ -299,6 +325,7 @@ impl Store {
         for sub in ["targets", "caches", "locks", "sockets"] {
             private_dir(&base.join(sub))?;
         }
+        private_dir(&base.join("pins"))?;
         Ok(Self { base })
     }
     fn lock(&self, kind: &str, id: &str, exclusive: bool, wait: bool) -> Result<Option<File>> {
@@ -379,9 +406,95 @@ impl Store {
         }
         Ok(e)
     }
+
+    fn target_id_from_artifacts_path(&self, target_dir: &Path) -> Result<String> {
+        let Some(id) = target_dir
+            .parent()
+            .filter(|_| {
+                target_dir
+                    .file_name()
+                    .is_some_and(|name| name == "artifacts")
+            })
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+        else {
+            bail!("target-dir 必须是 cslim 输出的受管 artifacts 路径");
+        };
+        if !valid_id(id) {
+            bail!("target-dir 中的 target ID 非法");
+        }
+        let expected = self.entry_dir("targets", id).join("artifacts");
+        if target_dir != expected {
+            bail!(
+                "只允许 pin 精确的受管 target-dir 路径: {}",
+                expected.display()
+            );
+        }
+        let entry_dir = self.entry_dir("targets", id);
+        let _ = self.read_entry("targets", &entry_dir)?;
+        private_existing_dir(&expected)?;
+        Ok(id.to_owned())
+    }
+
+    fn read_pin(&self, path: &Path) -> Result<Pin> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            bail!("不安全的 pin 记录: {}", path.display());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let pin: Pin = serde_json::from_reader(file)?;
+        let expected_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if pin.schema != SCHEMA
+            || pin.id != expected_id
+            || !valid_pin_id(&pin.id)
+            || !valid_id(&pin.target_id)
+            || !valid_label(&pin.owner, 128)
+            || !valid_label(&pin.reason, 512)
+            || !pin.metadata.is_object()
+        {
+            bail!("非法 pin 记录: {}", path.display());
+        }
+        Ok(pin)
+    }
+
+    fn pins(&self, target_id: Option<&str>) -> Result<Vec<Pin>> {
+        let mut pins = Vec::new();
+        for item in fs::read_dir(self.base.join("pins"))? {
+            let path = item?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let pin = self.read_pin(&path)?;
+            if target_id.is_none_or(|id| pin.target_id == id) {
+                pins.push(pin);
+            }
+        }
+        pins.sort_by(|a, b| {
+            a.target_id
+                .cmp(&b.target_id)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(pins)
+    }
 }
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 100 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+fn valid_pin_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+fn valid_label(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
 }
 fn private_existing_dir(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
@@ -405,12 +518,30 @@ struct Entry {
     created_at: u64,
     last_used: u64,
 }
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GcState {
+    schema: u32,
+    last_scan_at: u64,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Pin {
+    schema: u32,
+    id: String,
+    target_id: String,
+    owner: String,
+    reason: String,
+    metadata: serde_json::Value,
+    created_at: u64,
+}
 #[derive(Serialize)]
 struct Row {
     #[serde(flatten)]
     entry: Entry,
     bytes: u64,
     busy: bool,
+    pins: Vec<Pin>,
 }
 fn dir_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
@@ -438,6 +569,11 @@ fn dir_size(path: &Path) -> Result<u64> {
 }
 fn rows(store: &Store, kind: &str) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
+    let pins = if kind == "targets" {
+        store.pins(None)?
+    } else {
+        Vec::new()
+    };
     for item in fs::read_dir(store.base.join(kind))? {
         let item = item?;
         let id = item.file_name().to_string_lossy().into_owned();
@@ -448,6 +584,11 @@ fn rows(store: &Store, kind: &str) -> Result<Vec<Row>> {
         let lock = store.lock(kind, &id, true, false)?;
         match store.read_entry(kind, &item.path()) {
             Ok(entry) => rows.push(Row {
+                pins: pins
+                    .iter()
+                    .filter(|pin| pin.target_id == id)
+                    .cloned()
+                    .collect(),
                 entry,
                 bytes: dir_size(&item.path())?,
                 busy: lock.is_none(),
@@ -482,6 +623,9 @@ fn status(store: &Store, json: bool) -> Result<()> {
                 if r.busy { "[使用中]" } else { "" },
                 r.entry.workspace.as_deref().unwrap_or("共享缓存")
             );
+            for pin in &r.pins {
+                println!("  pin {} owner={} reason={}", pin.id, pin.owner, pin.reason);
+            }
         }
         println!(
             "合计 {}（{} 个目录）",
@@ -492,16 +636,175 @@ fn status(store: &Store, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn create_pin(
+    store: &Store,
+    target_dir: &Path,
+    owner: String,
+    reason: String,
+    metadata: &str,
+) -> Result<Pin> {
+    if !valid_label(&owner, 128) {
+        bail!("owner 必须为 1..=128 字节且不能包含控制字符");
+    }
+    if !valid_label(&reason, 512) {
+        bail!("reason 必须为 1..=512 字节且不能包含控制字符");
+    }
+    if metadata.len() > 16 * 1024 {
+        bail!("metadata 最大为 16 KiB");
+    }
+    let metadata: serde_json::Value = serde_json::from_str(metadata)?;
+    if !metadata.is_object() {
+        bail!("metadata 必须是 JSON object");
+    }
+    let target_id = store.target_id_from_artifacts_path(target_dir)?;
+    let _target_lock = store
+        .lock("targets", &target_id, false, true)?
+        .context("无法锁定受管 target")?;
+    // Revalidate after acquiring the lock shared with Cargo and GC.
+    let _ = store.read_entry("targets", &store.entry_dir("targets", &target_id))?;
+
+    let mut random = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let id = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let pin = Pin {
+        schema: SCHEMA,
+        id: id.clone(),
+        target_id,
+        owner,
+        reason,
+        metadata,
+        created_at: now(),
+    };
+    let path = store.base.join("pins").join(format!("{id}.json"));
+    if path.exists() {
+        bail!("pin ID collision; retry the command");
+    }
+    write_json(&path, &pin)?;
+    Ok(pin)
+}
+
+fn list_pins(store: &Store, target_dir: Option<&Path>, json: bool) -> Result<()> {
+    let target_id = target_dir
+        .map(|path| store.target_id_from_artifacts_path(path))
+        .transpose()?;
+    let pins = store.pins(target_id.as_deref())?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&pins)?);
+    } else if pins.is_empty() {
+        println!("没有持久 pin");
+    } else {
+        for pin in pins {
+            println!(
+                "{} target={} owner={} reason={} created_at={}",
+                pin.id, pin.target_id, pin.owner, pin.reason, pin.created_at
+            );
+        }
+    }
+    Ok(())
+}
+
+fn remove_pin(store: &Store, id: &str, owner: &str) -> Result<()> {
+    if !valid_pin_id(id) {
+        bail!("pin ID 格式无效");
+    }
+    if !valid_label(owner, 128) {
+        bail!("owner 必须为 1..=128 字节且不能包含控制字符");
+    }
+    let path = store.base.join("pins").join(format!("{id}.json"));
+    let pin = store.read_pin(&path)?;
+    if pin.owner != owner {
+        bail!("pin owner 不匹配，拒绝删除");
+    }
+    let _target_lock = store
+        .lock("targets", &pin.target_id, false, true)?
+        .context("无法锁定受管 target")?;
+    // Re-read while holding the target lock used by GC; pin creation/removal cannot race it.
+    let current = store.read_pin(&path)?;
+    if current.owner != owner || current.target_id != pin.target_id {
+        bail!("pin 在锁定期间发生变化，拒绝删除");
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn read_gc_state(store: &Store) -> Result<Option<GcState>> {
+    let path = store.base.join("gc-state.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        bail!("不安全的 GC 状态文件: {}", path.display());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let state: GcState = serde_json::from_reader(file)?;
+    if state.schema != SCHEMA {
+        bail!("GC 状态文件版本不兼容");
+    }
+    Ok(Some(state))
+}
+
+fn record_gc_scan(store: &Store) -> Result<()> {
+    write_json(
+        &store.base.join("gc-state.json"),
+        &GcState {
+            schema: SCHEMA,
+            last_scan_at: now(),
+        },
+    )
+}
+
 fn gc(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()> {
     let Some(_gc_lock) = store.lock("gc", "global", true, false)? else {
         return Ok(());
     };
+    let result = gc_locked(store, cfg, apply, force_prune);
+    if result.is_ok() {
+        record_gc_scan(store)?;
+    }
+    result
+}
+
+fn gc_after_build(store: &Store, cfg: &Config) -> Result<()> {
+    let Some(_gc_lock) = store.lock("gc", "global", true, false)? else {
+        return Ok(());
+    };
+    let interval = cfg.auto_gc_min_interval_secs;
+    if interval > 0
+        && read_gc_state(store)?
+            .is_some_and(|state| now().saturating_sub(state.last_scan_at) < interval)
+    {
+        return Ok(());
+    }
+    gc_locked(store, cfg, true, false)?;
+    record_gc_scan(store)
+}
+
+fn gc_locked(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()> {
     let mut reclaimed: u64 = 0;
     let mut projected_sizes = BTreeMap::new();
 
     // Different Cargo hashes can be simultaneously valid feature/dependency variants.
     // Preserve warm targets unless TTL/capacity requires reclamation or prune is explicit.
     let target_list = rows(store, "targets")?;
+    for row in target_list.iter().filter(|row| !row.pins.is_empty()) {
+        for pin in &row.pins {
+            eprintln!(
+                "cslim: pin 保护 target {} (owner={}, reason={})",
+                row.entry.id, pin.owner, pin.reason
+            );
+        }
+    }
     let mut target_total: u64 = target_list.iter().map(|r| r.bytes).sum();
     let target_limit = cfg.target_max_gib;
     let over_capacity = target_limit > 0 && target_total > target_limit * (1 << 30);
@@ -520,9 +823,18 @@ fn gc(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()>
             if !force_prune && !expired && !over {
                 continue;
             }
+            if !r.pins.is_empty() {
+                eprintln!("cslim: 保留 pin 保护的 target {}", r.entry.id);
+                continue;
+            }
             let Some(_lock) = store.lock("targets", &r.entry.id, true, false)? else {
                 continue;
             };
+            let pins = store.pins(Some(&r.entry.id))?;
+            if !pins.is_empty() {
+                eprintln!("cslim: 保留 pin 保护的 target {}", r.entry.id);
+                continue;
+            }
             let path = store.entry_dir("targets", &r.entry.id);
             if store.read_entry("targets", &path)?.last_used != r.entry.last_used {
                 continue;
@@ -577,10 +889,18 @@ fn gc(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()>
             if !expired && !over {
                 continue;
             }
+            if kind == "targets" && !r.pins.is_empty() {
+                eprintln!("cslim: 保留 pin 保护的 target {}", r.entry.id);
+                continue;
+            }
             let Some(_lock) = store.lock(kind, &r.entry.id, true, false)? else {
                 eprintln!("cslim: 跳过使用中的 {} {}", kind, r.entry.id);
                 continue;
             };
+            if kind == "targets" && !store.pins(Some(&r.entry.id))?.is_empty() {
+                eprintln!("cslim: 保留 pin 保护的 target {}", r.entry.id);
+                continue;
+            }
             let path = store.entry_dir(kind, &r.entry.id);
             // Re-read under the deletion lock: a build may have used this entry since the scan.
             let current = store.read_entry(kind, &path)?;
@@ -673,10 +993,18 @@ fn prune_target_cmd(
     let mut total_stats = prune::PruneStats::default();
 
     for (id, ws) in &target_ids {
+        if !store.pins(Some(id))?.is_empty() {
+            eprintln!("cslim: 跳过 pin 保护的 target {id}");
+            continue;
+        }
         let Some(_lock) = store.lock("targets", id, true, false)? else {
             eprintln!("cslim: 跳过使用中的 targets {id}");
             continue;
         };
+        if !store.pins(Some(id))?.is_empty() {
+            eprintln!("cslim: 跳过 pin 保护的 target {id}");
+            continue;
+        }
 
         let artifacts = store.entry_dir("targets", id).join("artifacts");
         if !artifacts.is_dir() {
@@ -852,6 +1180,7 @@ fn forward(
     stats: bool,
 ) -> Result<i32> {
     let ctx = build_context(args, toolchain, cfg)?;
+    let is_clean = args.first().is_some_and(|arg| arg == "clean");
     // Lock order is always cache -> target. A shared cache allows different workspaces to build concurrently.
     let cache_lock = store.lock("caches", &ctx.cache_id, false, true)?.unwrap();
     {
@@ -877,6 +1206,9 @@ fn forward(
         return Ok(cmd.status()?.code().unwrap_or(1));
     }
     let target_lock = store.lock("targets", &ctx.target_id, true, true)?.unwrap();
+    if is_clean && !store.pins(Some(&ctx.target_id))?.is_empty() {
+        bail!("target 有外部持久 pin，先由对应 owner 执行 cslim unpin 再清理");
+    }
     let target = store.prepare(
         "targets",
         &ctx.target_id,
@@ -921,7 +1253,7 @@ fn forward(
     drop(target_lock);
     drop(cache_lock);
     if cfg.auto_gc
-        && let Err(e) = gc(store, cfg, true, false)
+        && let Err(e) = gc_after_build(store, cfg)
     {
         eprintln!("cslim: 自动回收失败: {e:#}");
     }
@@ -1175,6 +1507,22 @@ fn run() -> Result<i32> {
             }
             thread::sleep(Duration::from_secs(interval));
         },
+        Action::Pin {
+            target_dir,
+            owner,
+            reason,
+            metadata,
+        } => {
+            let pin = create_pin(&store, &target_dir, owner, reason, &metadata)?;
+            println!("{}", serde_json::to_string_pretty(&pin)?);
+        }
+        Action::Pins { target_dir, json } => {
+            list_pins(&store, target_dir.as_deref(), json)?;
+        }
+        Action::Unpin { id, owner } => {
+            remove_pin(&store, &id, &owner)?;
+            println!("已移除 pin {id}");
+        }
         Action::CacheStats => return forward(&store, &cfg, &[], toolchain.as_deref(), true),
         Action::Cargo(args) => return dispatch_cargo(&store, &cfg, &args, toolchain.as_deref()),
         Action::Projects => {
@@ -1305,6 +1653,73 @@ mod tests {
         assert!(fresh.exists());
     }
     #[test]
+    fn post_build_gc_is_throttled_but_manual_gc_can_reclaim_capacity() {
+        let (_tmp, store, mut cfg) = fixture();
+        cfg.auto_gc_min_interval_secs = 3600;
+        let first = target(&store, "abc", 15 * DAY);
+        gc_after_build(&store, &cfg).unwrap();
+        assert!(!first.exists());
+
+        let second = target(&store, "def", 15 * DAY);
+        gc_after_build(&store, &cfg).unwrap();
+        assert!(second.exists());
+        gc(&store, &cfg, true, false).unwrap();
+        assert!(!second.exists());
+    }
+    #[test]
+    fn post_build_gc_skips_when_another_process_holds_the_scan_lock() {
+        let (_tmp, store, mut cfg) = fixture();
+        cfg.auto_gc_min_interval_secs = 0;
+        let expired = target(&store, "abc", 15 * DAY);
+        let scan_lock = store.lock("gc", "global", true, true).unwrap().unwrap();
+        gc_after_build(&store, &cfg).unwrap();
+        assert!(expired.exists());
+        FileExt::unlock(&scan_lock).unwrap();
+        drop(scan_lock);
+        gc_after_build(&store, &cfg).unwrap();
+        assert!(!expired.exists());
+    }
+    #[test]
+    fn persistent_pin_protects_target_from_gc_and_prune_until_owner_unpins() {
+        let (_tmp, store, cfg) = fixture();
+        let artifacts = target(&store, "abc", 15 * DAY);
+        let pin = create_pin(
+            &store,
+            &artifacts,
+            "container-adapter".into(),
+            "container target".into(),
+            r#"{"container_id":"sha256:deadbeef"}"#,
+        )
+        .unwrap();
+        assert_eq!(store.pins(Some("abc")).unwrap(), vec![pin.clone()]);
+        gc(&store, &cfg, false, false).unwrap();
+        gc(&store, &cfg, true, false).unwrap();
+        prune_target_cmd(&store, &cfg, true, 1, true, true, None).unwrap();
+        assert!(artifacts.exists());
+        assert!(
+            store
+                .pins(Some("abc"))
+                .unwrap()
+                .iter()
+                .any(|item| item.id == pin.id)
+        );
+
+        assert!(remove_pin(&store, &pin.id, "another-owner").is_err());
+        remove_pin(&store, &pin.id, "container-adapter").unwrap();
+        assert!(store.pins(Some("abc")).unwrap().is_empty());
+        gc(&store, &cfg, true, false).unwrap();
+        assert!(!artifacts.exists());
+    }
+    #[test]
+    fn pin_rejects_external_paths_and_invalid_metadata() {
+        let (tmp, store, _cfg) = fixture();
+        let external = tmp.path().join("external/artifacts");
+        fs::create_dir_all(&external).unwrap();
+        assert!(create_pin(&store, &external, "owner".into(), "reason".into(), "{}").is_err());
+        let target_dir = target(&store, "abc", DAY);
+        assert!(create_pin(&store, &target_dir, "owner".into(), "reason".into(), "[]").is_err());
+    }
+    #[test]
     fn active_build_is_never_collected() {
         let (_tmp, store, cfg) = fixture();
         let p = target(&store, "abc", 15 * DAY);
@@ -1427,6 +1842,7 @@ mod tests {
         assert!(default_cfg.auto_prune_tests);
         assert_eq!(default_cfg.prune_keep, 1);
         assert!(default_cfg.gc_prune);
+        assert_eq!(default_cfg.auto_gc_min_interval_secs, 300);
 
         // 向下兼容：老配置（未包含这些字段）仍可正确反序列化，且不触发 deny_unknown_fields
         let parsed_old: Config = toml::from_str(

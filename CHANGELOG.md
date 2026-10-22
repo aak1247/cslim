@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Throttle post-build GC scans with a persistent, globally locked minimum interval (300 seconds by default); explicit GC and `watch` remain unthrottled.
+- Add persistent owner-tagged pins for existing cslim-managed targets. Pins protect targets from GC, prune, and `clean`, and require explicit owner-matched removal. External/container adapters must verify their own resource lifecycle before unpinning.
+- Keep arbitrary external `CARGO_TARGET_DIR` paths outside GC and pin ownership; no automatic adoption or deletion is added.
+
 ## 0.6.0
 
 - Added `slim_profile` configuration (enabled by default): automatically injects `profile.dev.package."*".debug=0` and `profile.test.package."*".debug=0` via Cargo config, omitting redundant debuginfo for third-party dependencies and reducing development target sizes by ~40% out of the box while keeping full debuginfo for workspace crates.

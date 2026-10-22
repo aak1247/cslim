@@ -10,8 +10,9 @@ cache_ttl_days = 30
 target_max_gib = 100
 cache_max_gib = 40
 cache_per_toolchain_gib = 10
-# GC after each wrapped build; the timer covers periods without builds.
+# Run automatic GC at most once per interval after wrapped builds; explicit GC and watch ignore it.
 auto_gc = true
+auto_gc_min_interval_secs = 300
 # Strip debuginfo from dependency builds in dev/test profiles to save disk space.
 slim_profile = true
 # Fine-grained target pruning settings:

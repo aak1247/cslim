@@ -26,8 +26,11 @@ class GcPreviewTests(unittest.TestCase):
         self.call('status')  # Let the binary create private owned store directories.
 
     def call(self, *args):
-        return subprocess.run([str(BINARY), *args], env=self.env,
-                              capture_output=True, text=True, check=True)
+        result = subprocess.run([str(BINARY), *args], env=self.env,
+                                capture_output=True, text=True)
+        if result.returncode:
+            self.fail(f'command {args!r} failed: {result.stderr}')
+        return result
 
     def target(self, target_id, age_days):
         entry = self.root / 'v1/targets' / target_id
@@ -77,6 +80,39 @@ class GcPreviewTests(unittest.TestCase):
         result = self.call('gc', '--apply')
         self.assertIn(f'已回收 {expected}', result.stderr)
         self.assertFalse(expired.exists())
+
+    def test_persistent_pin_protects_target_until_matching_owner_unpins(self):
+        entry, _runner = self.target('cc22', 15)
+        target_dir = entry / 'artifacts'
+        for path in (target_dir, target_dir / 'debug', target_dir / 'debug/deps'):
+            path.chmod(0o700)
+        result = self.call('pin', '--target-dir', str(target_dir),
+                           '--owner', 'container-adapter',
+                           '--reason', 'container build target',
+                           '--metadata', '{"container_id":"sha256:deadbeef"}')
+        pin = json.loads(result.stdout)
+        self.assertEqual(pin['target_id'], 'cc22')
+        self.assertEqual(pin['owner'], 'container-adapter')
+        self.assertEqual(pin['metadata']['container_id'], 'sha256:deadbeef')
+        self.assertEqual(len(pin['id']), 32)
+
+        rows = json.loads(self.call('status', '--json').stdout)
+        row = next(item for item in rows if item['id'] == 'cc22')
+        self.assertEqual(row['pins'][0]['id'], pin['id'])
+        self.assertEqual(json.loads(self.call('pins', '--json').stdout)[0]['id'], pin['id'])
+
+        preview = self.call('gc')
+        self.assertIn('pin 保护 target cc22', preview.stderr)
+        self.call('gc', '--apply')
+        self.assertTrue(entry.exists())
+
+        wrong_owner = subprocess.run(
+            [str(BINARY), 'unpin', pin['id'], '--owner', 'wrong-owner'],
+            env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(wrong_owner.returncode, 0)
+        self.call('unpin', pin['id'], '--owner', 'container-adapter')
+        self.call('gc', '--apply')
+        self.assertFalse(entry.exists())
 
 
 if __name__ == '__main__':
