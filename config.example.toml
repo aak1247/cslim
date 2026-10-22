@@ -19,7 +19,8 @@ slim_profile = true
 auto_prune_tests = true
 # Number of latest build versions to keep per artifact (rlib, rmeta, bin, so).
 prune_keep = 1
-# Run fine-grained pruning on targets before full eviction during GC.
+# Prune expired/capacity reclamation candidates before eviction, preserving warm targets.
+# Explicit `gc --prune` or `prune` also trims warm targets.
 gc_prune = true
 
 # Optional named project. Project commands run from the manifest directory.

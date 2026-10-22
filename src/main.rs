@@ -498,10 +498,10 @@ fn gc(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()>
     };
     let mut reclaimed: u64 = 0;
 
-    // 细粒度清理优先阶段：在检查整个 target 是否过期前，如果开启了细粒度清理
-    // (cslim gc --prune 或 cfg.gc_prune，或容量超限时的优先阶段)，先对闲置 target 执行 prune 瘦身
+    // Different Cargo hashes can be simultaneously valid feature/dependency variants.
+    // Preserve warm targets unless TTL/capacity requires reclamation or prune is explicit.
     let target_list = rows(store, "targets")?;
-    let target_total: u64 = target_list.iter().map(|r| r.bytes).sum();
+    let mut target_total: u64 = target_list.iter().map(|r| r.bytes).sum();
     let target_limit = cfg.target_max_gib;
     let over_capacity = target_limit > 0 && target_total > target_limit * (1 << 30);
     let should_prune = force_prune || cfg.gc_prune || over_capacity;
@@ -513,12 +513,30 @@ fn gc(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()>
             apply,
         };
         for r in &target_list {
+            let expired =
+                now().saturating_sub(r.entry.last_used) >= cfg.target_ttl_days.saturating_mul(DAY);
+            let over = target_limit > 0 && target_total > target_limit * (1 << 30);
+            if !force_prune && !expired && !over {
+                continue;
+            }
             let Some(_lock) = store.lock("targets", &r.entry.id, true, false)? else {
                 continue;
             };
+            let path = store.entry_dir("targets", &r.entry.id);
+            if store.read_entry("targets", &path)?.last_used != r.entry.last_used {
+                continue;
+            }
             let artifacts = store.entry_dir("targets", &r.entry.id).join("artifacts");
             if artifacts.is_dir() {
                 let stats = prune::prune_artifacts_dir(&artifacts, &prune_opts)?;
+                let remaining = if apply {
+                    dir_size(&path)?
+                } else {
+                    r.bytes.saturating_sub(stats.total_bytes_reclaimed)
+                };
+                target_total = target_total
+                    .saturating_sub(r.bytes)
+                    .saturating_add(remaining);
                 if stats.total_bytes_reclaimed > 0 {
                     eprintln!(
                         "{} targets {} prune 瘦身 {} (清理 {} 个文件)",
@@ -1421,18 +1439,9 @@ mod tests {
         assert_eq!(parsed_custom.prune_keep, 3);
         assert!(!parsed_custom.gc_prune);
     }
-    #[test]
-    fn gc_with_prune_shrinks_target_before_eviction() {
-        let (_tmp, store, mut cfg) = fixture();
-        cfg.target_max_gib = 1;
-        // target 大小在 prune 后会减小
+    fn prunable_target(store: &Store, id: &str) -> PathBuf {
         let p = store
-            .prepare(
-                "targets",
-                "aa11",
-                Some("/example".into()),
-                "rustc-test".into(),
-            )
+            .prepare("targets", id, Some("/example".into()), "rustc-test".into())
             .unwrap();
         let deps = p.join("debug/deps");
         fs::create_dir_all(&deps).unwrap();
@@ -1455,6 +1464,72 @@ mod tests {
         fs::write(deps.join("libdemo-1111111111111111.rlib"), "old").unwrap();
         std::thread::sleep(Duration::from_millis(15));
         fs::write(deps.join("libdemo-2222222222222222.rlib"), "new").unwrap();
+        p
+    }
+
+    #[test]
+    fn routine_gc_preserves_warm_variants_and_test_runners() {
+        let (_tmp, store, cfg) = fixture();
+        let p = prunable_target(&store, "aa11");
+        for apply in [false, true, true] {
+            gc(&store, &cfg, apply, false).unwrap();
+            assert!(p.join("debug/deps/test-1111111111111111").exists());
+            assert!(p.join("debug/deps/test-1111111111111111.d").exists());
+            assert!(p.join("debug/deps/libdemo-1111111111111111.rlib").exists());
+            assert!(p.join("debug/deps/libdemo-2222222222222222.rlib").exists());
+        }
+    }
+
+    #[test]
+    fn capacity_prunes_only_needed_idle_targets_and_preserves_active_builds() {
+        let (_tmp, store, mut cfg) = fixture();
+        cfg.target_max_gib = 1;
+        let p = prunable_target(&store, "aa11");
+        let other = prunable_target(&store, "bb22");
+        let mut entry = store.read_entry("targets", p.parent().unwrap()).unwrap();
+        entry.last_used -= DAY;
+        write_json(&p.parent().unwrap().join("entry.json"), &entry).unwrap();
+        let bin = p.join("debug/deps/test-1111111111111111");
+        let file = OpenOptions::new().write(true).open(&bin).unwrap();
+        assert_eq!(
+            unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, (1 << 30) + 4096) },
+            0
+        );
+        drop(file);
+        let lock = store.lock("targets", "aa11", true, true).unwrap().unwrap();
+        let other_lock = store.lock("targets", "bb22", true, true).unwrap().unwrap();
+        gc(&store, &cfg, true, false).unwrap();
+        assert!(bin.exists());
+        assert!(p.join("debug/deps/libdemo-1111111111111111.rlib").exists());
+        FileExt::unlock(&lock).unwrap();
+        drop(lock);
+        FileExt::unlock(&other_lock).unwrap();
+        drop(other_lock);
+        for _ in 0..20 {
+            gc(&store, &cfg, true, false).unwrap();
+            if !bin.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!bin.exists());
+        assert!(p.join("debug/deps/libdemo-2222222222222222.rlib").exists());
+        assert!(other.join("debug/deps/test-1111111111111111").exists());
+        assert!(
+            other
+                .join("debug/deps/libdemo-1111111111111111.rlib")
+                .exists()
+        );
+        assert!(dir_size(&store.base.join("targets")).unwrap() < 1 << 30);
+    }
+
+    #[test]
+    fn explicit_gc_prune_still_trims_warm_targets() {
+        let (_tmp, store, cfg) = fixture();
+        let p = prunable_target(&store, "aa11");
+        let deps = p.join("debug/deps");
+        let test_bin = deps.join("test-1111111111111111");
+        let test_d = deps.join("test-1111111111111111.d");
 
         // 执行带 prune 的 gc
         gc(&store, &cfg, true, true).unwrap();
