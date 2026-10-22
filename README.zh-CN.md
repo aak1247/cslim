@@ -171,7 +171,7 @@ cslim migrate --recover /absolute/root/v1/imports/TRANSACTION.json
 - **细粒度裁剪（Prune）与瘦身优先。** 在全量淘汰 target 之前，`cslim gc` 仅对过期或总容量超限时需要回收的闲置 target 进行细粒度裁剪，容量回到上限以内后即停止容量裁剪。未过期且未超额的热 target 保留依赖/feature 变体和集成测试可执行文件，避免 routine GC 删除下一次仍会使用的产物。显式 `cslim prune` 或 `cslim gc --prune` 仍可裁剪热 target，随后 Cargo 可能需要重建被删变体。此外，默认开启的 `slim_profile = true` 会向 Cargo 注入依赖免 debuginfo 配置，减少日常构建中约 40% 的 target 增量体积。
 - **CoW (Reflink) 零成本克隆。** 在执行 `cslim migrate` 导入旧 target 时，自动尝试 Linux `FICLONE` 系统调用进行 CoW 克隆；在支持的文件系统（XFS、Btrfs）上实现零额外磁盘开销克隆，并在不支持或跨设备时优雅降级为保留纳秒时间戳的标准复制。
 - **不能限制单次构建的峰值。**一个项目构建到 120 GiB 仍会完成；构建结束后，GC 可能把刚生成的整个 target 删除。若希望保留它，应把 `target_max_gib` 调到高于该项目的实际大小。活跃构建不会被中途删除。
-- 默认 14 天未使用的 target 和 30 天未使用的共享缓存命名空间会过期。封装构建结束后最多每 300 秒自动扫描一次，时间戳由全局 GC 锁保护；设 `auto_gc_min_interval_secs = 0` 可恢复每次构建结束扫描。显式 `cslim gc` 与 `watch` 不受节流影响，需要时可主动发起回收扫描；安装 `--timer` 后即使没有构建也每小时检查一次。`cslim gc` 默认只预览，`cslim gc --apply` 才真正删除。普通项目目录下的旧 `target/` 不会自动删除。
+- 默认 14 天未使用的 target 和 30 天未使用的共享缓存命名空间会过期。封装构建结束后最多每 300 秒自动扫描一次，时间戳由全局 GC 锁保护；若文件系统可用空间低于默认 2 GiB，则通过廉价 `statvfs` 检查绕过节流，设 `auto_gc_min_free_gib = 0` 可关闭此压力例外，设 `auto_gc_min_interval_secs = 0` 则每次构建结束都扫描。容量上限是软上限，活跃构建期间以及两次自动扫描之间都可能暂时超额；没有后续构建时由显式 `gc` 或 timer 发起扫描。显式 `cslim gc` 与 `watch` 不受节流影响；安装 `--timer` 后即使没有构建也每小时检查一次。`cslim gc` 默认只预览且不更新自动扫描时间，`cslim gc --apply` 才真正删除并记录成功扫描。普通项目目录下的旧 `target/` 不会自动删除。
 - TTL 在整个 workspace/工具链 target 或共享缓存命名空间层面生效，按最近一次封装调用开始/结束的时间计算，不扫描单个 crate 的使用时间。
 - 超过总容量上限时按最近使用时间淘汰整个闲置目录。活跃目录不能淘汰，因此这是构建之间的软上限；单次构建仍可能超过上限。
 - `target_max_gib` / `cache_max_gib` 为 0 表示不按总容量回收；TTL 为 0 表示闲置后立即过期。`cache_per_toolchain_gib` 必须大于 0。

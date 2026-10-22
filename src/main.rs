@@ -5,10 +5,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::CString,
+    fs,
     fs::{File, OpenOptions},
     io::{ErrorKind, Read},
     os::unix::{
+        ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
         io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
@@ -167,6 +170,7 @@ struct Config {
     sccache: PathBuf,
     auto_gc: bool,
     auto_gc_min_interval_secs: u64,
+    auto_gc_min_free_gib: u64,
     slim_profile: bool,
     auto_prune_tests: bool,
     prune_keep: usize,
@@ -191,6 +195,7 @@ impl Default for Config {
             sccache: "sccache".into(),
             auto_gc: true,
             auto_gc_min_interval_secs: 300,
+            auto_gc_min_free_gib: 2,
             slim_profile: true,
             auto_prune_tests: true,
             prune_keep: 1,
@@ -764,26 +769,69 @@ fn record_gc_scan(store: &Store) -> Result<()> {
     )
 }
 
+fn available_bytes(path: &Path) -> Option<u64> {
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stat = unsafe { stat.assume_init() };
+    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+fn auto_gc_due(
+    interval_secs: u64,
+    min_free_gib: u64,
+    last_scan_at: Option<u64>,
+    current_time: u64,
+    available: Option<u64>,
+) -> bool {
+    if interval_secs == 0
+        || last_scan_at.is_none_or(|last| current_time.saturating_sub(last) >= interval_secs)
+    {
+        return true;
+    }
+    let free_floor = min_free_gib.saturating_mul(1 << 30);
+    free_floor > 0 && available.is_some_and(|bytes| bytes < free_floor)
+}
+
 fn gc(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()> {
     let Some(_gc_lock) = store.lock("gc", "global", true, false)? else {
         return Ok(());
     };
     let result = gc_locked(store, cfg, apply, force_prune);
-    if result.is_ok() {
+    if apply && result.is_ok() {
         record_gc_scan(store)?;
     }
     result
 }
 
 fn gc_after_build(store: &Store, cfg: &Config) -> Result<()> {
+    let available = if cfg.auto_gc_min_free_gib > 0 {
+        available_bytes(&store.base)
+    } else {
+        None
+    };
+    gc_after_build_with_available(store, cfg, available)
+}
+
+fn gc_after_build_with_available(
+    store: &Store,
+    cfg: &Config,
+    available: Option<u64>,
+) -> Result<()> {
     let Some(_gc_lock) = store.lock("gc", "global", true, false)? else {
         return Ok(());
     };
     let interval = cfg.auto_gc_min_interval_secs;
-    if interval > 0
-        && read_gc_state(store)?
-            .is_some_and(|state| now().saturating_sub(state.last_scan_at) < interval)
-    {
+    let last_scan_at = read_gc_state(store)?.map(|state| state.last_scan_at);
+    if !auto_gc_due(
+        interval,
+        cfg.auto_gc_min_free_gib,
+        last_scan_at,
+        now(),
+        available,
+    ) {
         return Ok(());
     }
     gc_locked(store, cfg, true, false)?;
@@ -1667,6 +1715,80 @@ mod tests {
         assert!(!second.exists());
     }
     #[test]
+    fn post_build_gc_bypasses_interval_below_the_configured_free_space_floor() {
+        let (_tmp, store, mut cfg) = fixture();
+        cfg.auto_gc_min_interval_secs = 3600;
+        cfg.auto_gc_min_free_gib = 2;
+        let expired = target(&store, "abc", 15 * DAY);
+        record_gc_scan(&store).unwrap();
+
+        gc_after_build_with_available(&store, &cfg, Some((2 << 30) - 1)).unwrap();
+        assert!(
+            !expired.exists(),
+            "low filesystem space bypasses recent-scan throttling"
+        );
+    }
+    #[test]
+    fn preview_does_not_advance_the_automatic_gc_timestamp() {
+        let (_tmp, store, mut cfg) = fixture();
+        cfg.auto_gc_min_interval_secs = 3600;
+        let old_timestamp = now().saturating_sub(10_000);
+        write_json(
+            &store.base.join("gc-state.json"),
+            &GcState {
+                schema: SCHEMA,
+                last_scan_at: old_timestamp,
+            },
+        )
+        .unwrap();
+        let expired = target(&store, "abc", 15 * DAY);
+
+        gc(&store, &cfg, false, false).unwrap();
+        let state = read_gc_state(&store).unwrap().unwrap();
+        assert_eq!(state.last_scan_at, old_timestamp);
+        assert!(expired.exists(), "preview does not remove its candidate");
+
+        gc_after_build_with_available(&store, &cfg, Some(10 << 30)).unwrap();
+        assert!(
+            !expired.exists(),
+            "the old scan timestamp still allows automatic GC"
+        );
+    }
+    #[test]
+    fn automatic_gc_throttle_pressure_boundary_is_strict_and_configurable() {
+        let timestamp = 1_000;
+        let floor = 2 << 30;
+        assert!(!auto_gc_due(
+            300,
+            2,
+            Some(timestamp),
+            timestamp + 1,
+            Some(floor)
+        ));
+        assert!(auto_gc_due(
+            300,
+            2,
+            Some(timestamp),
+            timestamp + 1,
+            Some(floor - 1)
+        ));
+        assert!(!auto_gc_due(300, 2, Some(timestamp), timestamp + 1, None));
+        assert!(!auto_gc_due(
+            300,
+            0,
+            Some(timestamp),
+            timestamp + 1,
+            Some(0)
+        ));
+        assert!(auto_gc_due(
+            0,
+            0,
+            Some(timestamp),
+            timestamp + 1,
+            Some(u64::MAX)
+        ));
+    }
+    #[test]
     fn post_build_gc_skips_when_another_process_holds_the_scan_lock() {
         let (_tmp, store, mut cfg) = fixture();
         cfg.auto_gc_min_interval_secs = 0;
@@ -1843,6 +1965,7 @@ mod tests {
         assert_eq!(default_cfg.prune_keep, 1);
         assert!(default_cfg.gc_prune);
         assert_eq!(default_cfg.auto_gc_min_interval_secs, 300);
+        assert_eq!(default_cfg.auto_gc_min_free_gib, 2);
 
         // 向下兼容：老配置（未包含这些字段）仍可正确反序列化，且不触发 deny_unknown_fields
         let parsed_old: Config = toml::from_str(
@@ -1855,6 +1978,7 @@ mod tests {
         assert!(parsed_old.auto_prune_tests);
         assert_eq!(parsed_old.prune_keep, 1);
         assert!(parsed_old.gc_prune);
+        assert_eq!(parsed_old.auto_gc_min_free_gib, 2);
 
         // 自定义配置项
         let parsed_custom: Config = toml::from_str(
@@ -1868,6 +1992,9 @@ mod tests {
         assert!(!parsed_custom.auto_prune_tests);
         assert_eq!(parsed_custom.prune_keep, 3);
         assert!(!parsed_custom.gc_prune);
+
+        let parsed_pressure: Config = toml::from_str("auto_gc_min_free_gib = 0").unwrap();
+        assert_eq!(parsed_pressure.auto_gc_min_free_gib, 0);
     }
     fn prunable_target(store: &Store, id: &str) -> PathBuf {
         let p = store

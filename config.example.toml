@@ -13,6 +13,8 @@ cache_per_toolchain_gib = 10
 # Run automatic GC at most once per interval after wrapped builds; explicit GC and watch ignore it.
 auto_gc = true
 auto_gc_min_interval_secs = 300
+# Bypass that interval when available filesystem space falls below this floor; 0 disables the bypass.
+auto_gc_min_free_gib = 2
 # Strip debuginfo from dependency builds in dev/test profiles to save disk space.
 slim_profile = true
 # Fine-grained target pruning settings:
