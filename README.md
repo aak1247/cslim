@@ -81,6 +81,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked
 python3 scripts/test_cslim_dev.py
+python3 scripts/test_gc.py target/debug/cargo-cslim
 python3 scripts/test_worktrees.py target/debug/cargo-cslim
 python3 scripts/smoke.py
 ```

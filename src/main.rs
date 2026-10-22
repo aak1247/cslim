@@ -497,6 +497,7 @@ fn gc(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()>
         return Ok(());
     };
     let mut reclaimed: u64 = 0;
+    let mut projected_sizes = BTreeMap::new();
 
     // Different Cargo hashes can be simultaneously valid feature/dependency variants.
     // Preserve warm targets unless TTL/capacity requires reclamation or prune is explicit.
@@ -537,6 +538,9 @@ fn gc(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()>
                 target_total = target_total
                     .saturating_sub(r.bytes)
                     .saturating_add(remaining);
+                if !apply {
+                    projected_sizes.insert(r.entry.id.clone(), (r.entry.last_used, remaining));
+                }
                 if stats.total_bytes_reclaimed > 0 {
                     eprintln!(
                         "{} targets {} prune 瘦身 {} (清理 {} 个文件)",
@@ -555,7 +559,17 @@ fn gc(store: &Store, cfg: &Config, apply: bool, force_prune: bool) -> Result<()>
         ("targets", cfg.target_ttl_days, cfg.target_max_gib),
         ("caches", cfg.cache_ttl_days, cfg.cache_max_gib),
     ] {
-        let list = rows(store, kind)?;
+        let mut list = rows(store, kind)?;
+        if !apply && kind == "targets" {
+            // Preview must simulate eviction after pruning, not count the same bytes twice.
+            for r in &mut list {
+                if let Some(&(last_used, remaining)) = projected_sizes.get(&r.entry.id)
+                    && r.entry.last_used == last_used
+                {
+                    r.bytes = remaining;
+                }
+            }
+        }
         let mut total: u64 = list.iter().map(|r| r.bytes).sum();
         for r in list {
             let expired = now().saturating_sub(r.entry.last_used) >= days.saturating_mul(DAY);
@@ -1478,6 +1492,25 @@ mod tests {
             assert!(p.join("debug/deps/libdemo-1111111111111111.rlib").exists());
             assert!(p.join("debug/deps/libdemo-2222222222222222.rlib").exists());
         }
+    }
+
+    #[test]
+    fn expired_prunable_target_is_still_evicted() {
+        let (_tmp, store, cfg) = fixture();
+        let p = prunable_target(&store, "aa11");
+        let mut entry = store.read_entry("targets", p.parent().unwrap()).unwrap();
+        entry.last_used -= 15 * DAY;
+        write_json(&p.parent().unwrap().join("entry.json"), &entry).unwrap();
+        gc(&store, &cfg, false, false).unwrap();
+        assert!(p.join("debug/deps/test-1111111111111111").exists());
+        for _ in 0..20 {
+            gc(&store, &cfg, true, false).unwrap();
+            if !p.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!p.exists());
     }
 
     #[test]
